@@ -47,13 +47,29 @@ of messages a call touches:
    prints the startup time, `tools/list` time and per-call time without
    printing mail content.
 
+## "Blocked by --read-only"
+
+With `--read-only` the server registers only an allowlist:
+- every read tool, from listing and searching to the thread and raw-source
+  views, statistics, follow-ups and the dashboard;
+- `save_email_attachment` and `export_emails`, which write local files only;
+- `synchronize_account`, which fetches new mail;
+- `create_rich_email_draft`, and `manage_drafts` with `action` `create` or
+  `list`.
+
+Everything else is not registered, and it is refused at call time with
+"... is blocked by --read-only". That covers sending, replying, forwarding,
+moving, flagging, marking, trash, creating mailboxes, and sending, opening or
+deleting drafts. It is intended behaviour. The user does those in Mail, or
+runs a server without `--read-only`.
+
 ## Known fixed causes (this fork)
 
 Earlier versions walked whole mailboxes one message at a time and forked a
 shell per lowercase conversion. Measured on a 7,018-message inbox, these
 calls timed out or took 70 to 300 s: `list_inbox_emails()` with its old
 "all messages" default, `get_awaiting_reply`, `get_email_thread`,
-`get_statistics`, `move_email`, `save_email_attachment` and
+`get_statistics`, `save_email_attachment` and
 `search_emails(body_text=...)`. They now use whose-clause filters and bulk
 property fetches.
 

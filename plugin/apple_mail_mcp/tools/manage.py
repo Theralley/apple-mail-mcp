@@ -3,6 +3,7 @@
 import os
 from typing import Optional, List
 
+from apple_mail_mcp import server
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
     resolve_flag_color,
@@ -59,6 +60,9 @@ def move_email(
     Returns:
         Confirmation message with details of moved emails
     """
+    blocked = server.read_only_block("move_email")
+    if blocked:
+        return blocked
 
     safe_account = escape_applescript(account)
     safe_from = escape_applescript(from_mailbox)
@@ -408,6 +412,9 @@ def update_email_status(
     Returns:
         Confirmation message with details of updated emails
     """
+    blocked = server.read_only_block("update_email_status")
+    if blocked:
+        return blocked
 
     safe_account = escape_applescript(account)
 
@@ -653,6 +660,9 @@ def manage_trash(
     Returns:
         Confirmation message with details of deleted emails
     """
+    blocked = server.read_only_block("manage_trash")
+    if blocked:
+        return blocked
 
     # Escape all user inputs for AppleScript
     safe_account = escape_applescript(account)
@@ -896,6 +906,10 @@ def create_mailbox(
     Returns:
         Confirmation with the new mailbox path.
     """
+    blocked = server.read_only_block("create_mailbox")
+    if blocked:
+        return blocked
+
     # Validate name
     if not name or not name.strip():
         return "Error: Mailbox name cannot be empty."

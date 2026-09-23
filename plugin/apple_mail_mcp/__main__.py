@@ -1,6 +1,7 @@
 """Entry point for `python -m apple_mail_mcp` and `apple-mail-mcp` CLI."""
 
 import argparse
+import asyncio
 import os
 import threading
 import time
@@ -41,24 +42,29 @@ def main():
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Disable tools that send email (compose, reply, forward). "
-             "Drafts can still be created and listed.",
+        help="Only read mail, save attachments/exports locally, sync, and "
+             "create or list drafts. Every other tool is removed.",
     )
     args = parser.parse_args()
 
-    server.READ_ONLY = args.read_only
+    configure(read_only=args.read_only)
 
     from apple_mail_mcp import mcp  # noqa: E402
 
-    SEND_TOOLS = ["compose_email", "reply_to_email", "forward_email"]
-    if args.read_only:
-        for name in SEND_TOOLS:
-            try:
-                mcp.remove_tool(name)
-            except (KeyError, ValueError):
-                pass
-
     mcp.run()
+
+
+def configure(read_only: bool) -> None:
+    """Set the read-only flag and, when set, keep only allowlisted tools."""
+    server.READ_ONLY = read_only
+    if not read_only:
+        return
+
+    from apple_mail_mcp import mcp  # noqa: E402
+
+    for tool in asyncio.run(mcp.list_tools()):
+        if tool.name not in server.READ_ONLY_ALLOWED_TOOLS:
+            mcp.remove_tool(tool.name)
 
 
 if __name__ == "__main__":

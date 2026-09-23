@@ -2,7 +2,7 @@
 
 Every skills/<name>/SKILL.md must have YAML frontmatter with a matching
 `name` and a trigger-style `description`, and every tool it calls — written
-as `tool_name(` in backticks — must be registered by this server. The live
+as `tool_name(` in backticks — must be on the --read-only allowlist. The live
 counterpart (running each skill's read-only steps against Mail.app) is
 scripts/e2e_mail.py --skills.
 """
@@ -12,12 +12,11 @@ import re
 import unittest
 from pathlib import Path
 
-from apple_mail_mcp import mcp
+from apple_mail_mcp import mcp, server
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 TOOL_CALL_RE = re.compile(r"`([a-z][a-z0-9_]*)\(")
-# Registered normally but removed by --read-only; skills must not rely on them.
-SEND_TOOLS = {"compose_email", "reply_to_email", "forward_email"}
+DRAFT_ACTION_RE = re.compile(r"`manage_drafts\([^`]*action=\"([a-z_]+)\"")
 
 
 def _skill_files():
@@ -56,14 +55,16 @@ class SkillLibraryTests(unittest.TestCase):
                 self.assertIn("Use when", description)
                 self.assertLessEqual(len(description), 1024)
 
-    def test_referenced_tools_exist(self):
-        registered = _registered_tools()
-        allowed = registered - SEND_TOOLS
+    def test_referenced_tools_are_read_only_allowlisted(self):
+        allowed = _registered_tools() & server.READ_ONLY_ALLOWED_TOOLS
         for path in _skill_files():
             with self.subTest(skill=path.parent.name):
-                referenced = set(TOOL_CALL_RE.findall(path.read_text(encoding="utf-8")))
+                text = path.read_text(encoding="utf-8")
+                referenced = set(TOOL_CALL_RE.findall(text))
                 self.assertTrue(referenced, "skill references no tools")
                 self.assertEqual(referenced - allowed, set())
+                actions = set(DRAFT_ACTION_RE.findall(text))
+                self.assertEqual(actions - server.READ_ONLY_DRAFT_ACTIONS, set())
 
 
 if __name__ == "__main__":

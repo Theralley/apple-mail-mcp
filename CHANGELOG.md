@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`--read-only` is now a strict allowlist:** read mail, save attachments,
+  export to local files, sync, and create or list drafts; nothing else.
+  Previously it only removed the three send tools, so moving, flagging,
+  marking, trashing (including `empty_trash`), creating mailboxes, and
+  deleting or opening drafts all still worked. Tools not on
+  `READ_ONLY_ALLOWED_TOOLS`, including any added later, are removed at
+  startup. The mutating tools also refuse at call time with a
+  "blocked by --read-only" error, and `manage_drafts` accepts only `create`
+  and `list`. The README lists the exact set.
+
 ### Fixed
 - **Timeouts on large mailboxes.** Mail answers one Apple Event per property
   read, so tools that walked a whole mailbox message by message ran into the

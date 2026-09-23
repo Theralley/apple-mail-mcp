@@ -10,10 +10,13 @@ their real names.
 | `apple-mail-thread-summary` | Find a conversation and summarise it |
 | `apple-mail-attachments` | List and save attachments |
 | `apple-mail-follow-ups` | Sent mail with no reply, received mail you still owe a reply |
-| `apple-mail-safe-drafts` | Draft-first composing; never sends on its own |
+| `apple-mail-safe-drafts` | Create drafts for the user to review and send in Mail |
 | `apple-mail-troubleshooting` | Timeouts, empty results, permission and startup problems |
 
-The server must be configured in Claude Code, for example as `apple-mail`.
+The skills are written for a server running with `--read-only`. They call
+only tools on the read-only allowlist, and `manage_drafts` only with `create`
+and `list`. The server must be configured in Claude Code, for example as
+`apple-mail`.
 The skills name tools without the `mcp__<server>__` prefix. Claude resolves
 them to whatever name the server is registered under.
 
@@ -36,7 +39,7 @@ plugin's `skills/` directory, next to `plugin/skills/email-management`.
 ## Tests
 
 - `tests/test_skills.py` runs in CI. It checks each `SKILL.md`'s frontmatter
-  and that every tool a skill calls (written as `` `tool_name(` ``) is
-  registered by the server.
+  and that every tool a skill calls (written as `` `tool_name(` ``) is on the
+  `--read-only` allowlist, with `manage_drafts` used only for `create`/`list`.
 - `scripts/e2e_mail.py --skills` runs each skill's read-only steps against
   the real Mail.app on macOS. It prints timings only, never mail content.

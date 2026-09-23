@@ -654,6 +654,9 @@ def reply_to_email(
     Returns:
         Confirmation message with details of the reply sent, saved draft, or opened draft
     """
+    blocked = server.read_only_block("reply_to_email")
+    if blocked:
+        return blocked
 
     reply_body = _strip_cdata_wrappers(reply_body) or ""
     body_html = _strip_cdata_wrappers(body_html)
@@ -992,6 +995,9 @@ def compose_email(
     Returns:
         Confirmation message with details of the email
     """
+    blocked = server.read_only_block("compose_email")
+    if blocked:
+        return blocked
 
     # Validate mode
     if mode not in ("send", "draft", "open"):
@@ -1188,6 +1194,9 @@ def forward_email(
     Returns:
         Confirmation message with details of forwarded email
     """
+    blocked = server.read_only_block("forward_email")
+    if blocked:
+        return blocked
 
     message = _strip_cdata_wrappers(message)
 
@@ -1415,6 +1424,8 @@ def manage_drafts(
     """
     Manage draft emails - list, create, send, open, or delete drafts.
 
+    Under --read-only only "create" and "list" are allowed.
+
     Args:
         account: Account name (e.g., "Gmail", "Work")
         action: Action to perform: "list", "create", "send", "open", "delete". Use "open" to open a draft in a visible compose window for review before sending.
@@ -1429,6 +1440,9 @@ def manage_drafts(
     Returns:
         Formatted output based on action
     """
+    blocked = server.read_only_block("manage_drafts", action)
+    if blocked:
+        return blocked
 
     body = _strip_cdata_wrappers(body)
 
@@ -1546,11 +1560,6 @@ def manage_drafts(
         '''
 
     elif action == "send":
-        # Read the flag at call time: this module is imported (via the
-        # package __init__) before __main__ sets server.READ_ONLY, so a
-        # value imported at module level is always False.
-        if server.READ_ONLY:
-            return "Error: Sending drafts is disabled in read-only mode."
         if not draft_subject:
             return "Error: 'draft_subject' is required for sending drafts"
 

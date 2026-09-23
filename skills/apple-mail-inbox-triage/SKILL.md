@@ -29,8 +29,7 @@ unless the user asks for it afterwards.
 
 - Do not call `list_inbox_emails` with `max_emails=0` or `include_content=true`
   on a large inbox. Both are slow, and the output is too big to be useful.
-- Moves, flags and read-status changes (`move_email`, `update_email_status`)
-  come only after the user confirms. Preview with `move_email(..., dry_run=true)`
-  first.
+- This skill only reports. The read-only server cannot move, flag, mark or
+  delete mail. Suggest those actions for the user to do in Mail.
 - If a call times out, narrow it with `account`, a shorter `days_back`, or a
   smaller `max_emails`. The `apple-mail-troubleshooting` skill covers the rest.

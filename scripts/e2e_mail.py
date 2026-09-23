@@ -10,8 +10,8 @@ Safety rules the script enforces:
     mail and never empties the trash;
   * mutating tools only run in dry-run mode, or against a subject that matches
     nothing ("[mcp-e2e] no-such-message-<uuid>");
-  * the write path is exercised only when --draft-account and --draft-to are
-    given: it creates one draft with subject "[mcp-e2e] <uuid>" and deletes
+  * the write path is exercised only against a server without --read-only
+    and when --draft-account and --draft-to are given: it creates one draft with subject "[mcp-e2e] <uuid>" and deletes
     that same draft again. Mail keeps the invisible outgoing message that
     manage_drafts(action="create") opens until Mail quits (AppleScript cannot
     close it), so the draft can be re-saved later; delete any leftover
@@ -57,6 +57,7 @@ class Runner:
         self.timeout = timeout
         self.called = set()
         self.failures = 0
+        self.read_only = False
 
     def call(self, tool, args, label=None, expect=None, allow_error=False):
         """Call *tool*; return its text. *expect* must occur in the output."""
@@ -142,14 +143,17 @@ def run_tools(runner, args, tmp):
     runner.call("get_awaiting_reply", {"account": acct, "days_back": 7})
     runner.call("inbox_dashboard", {}, allow_error=True)
 
-    # Mutating tools: dry run and/or a subject that matches nothing.
-    runner.call("move_email", {"account": acct, "to_mailbox": "INBOX", "subject_keyword": nomatch, "dry_run": True, "max_moves": 1}, label="move_email (dry run, no match)")
-    runner.call("update_email_status", {"account": acct, "action": "mark_read", "subject_keyword": nomatch, "max_updates": 1}, label="update_email_status (no match)")
-    runner.call("manage_trash", {"account": acct, "action": "move_to_trash", "subject_keyword": nomatch, "dry_run": True, "max_deletes": 1}, label="manage_trash (dry run, no match)")
+    # Mutating tools (only registered without --read-only): dry run and/or a
+    # subject that matches nothing.
+    if not runner.read_only:
+        runner.call("move_email", {"account": acct, "to_mailbox": "INBOX", "subject_keyword": nomatch, "dry_run": True, "max_moves": 1}, label="move_email (dry run, no match)")
+        runner.call("update_email_status", {"account": acct, "action": "mark_read", "subject_keyword": nomatch, "max_updates": 1}, label="update_email_status (no match)")
+        runner.call("manage_trash", {"account": acct, "action": "move_to_trash", "subject_keyword": nomatch, "dry_run": True, "max_deletes": 1}, label="manage_trash (dry run, no match)")
     runner.call("manage_drafts", {"account": acct, "action": "list"}, label="manage_drafts (list)")
-    # Under --read-only this must be refused before Mail is touched; the
-    # subject matches nothing either way.
-    runner.call("manage_drafts", {"account": acct, "action": "send", "draft_subject": nomatch}, label="manage_drafts (send refused, read-only)", expect="read-only", allow_error=True)
+    if runner.read_only:
+        # Refused before Mail is touched; the subject matches nothing anyway.
+        for action in ("send", "delete", "open"):
+            runner.call("manage_drafts", {"account": acct, "action": action, "draft_subject": nomatch}, label=f"manage_drafts ({action} blocked)", expect="blocked by --read-only", allow_error=True)
 
     rich_path = tmp / "mcp-e2e.eml"
     runner.call(
@@ -158,7 +162,9 @@ def run_tools(runner, args, tmp):
         label="create_rich_email_draft (.eml only)",
     )
 
-    if args.draft_account and args.draft_to:
+    if runner.read_only:
+        print("SKIP  manage_drafts create/delete                (delete is blocked by --read-only)")
+    elif args.draft_account and args.draft_to:
         run_draft_roundtrip(runner, args)
     else:
         print("SKIP  manage_drafts create/delete                (pass --draft-account and --draft-to)")
@@ -251,8 +257,12 @@ def main():
         tools = {t["name"] for t in client.list_tools()}
         print(f"tools/list: {len(tools)} tools")
         runner = Runner(client, args.timeout)
+        # --read-only registers an allowlist without the mutating tools.
+        runner.read_only = "move_email" not in tools
         if not args.skills_only:
             run_tools(runner, args, tmp)
+            if runner.read_only:
+                print(f"read-only server: {len(tools)} tools registered")
             for name in sorted(tools - runner.called):
                 reason = SKIPPED.get(name)
                 if reason:

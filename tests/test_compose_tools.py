@@ -917,7 +917,7 @@ class ManageDraftsReadOnlyTests(unittest.TestCase):
         finally:
             server.READ_ONLY = original
 
-        self.assertIn("disabled in read-only mode", result)
+        self.assertIn("blocked by --read-only", result)
         run.assert_not_called()
 
 if __name__ == "__main__":

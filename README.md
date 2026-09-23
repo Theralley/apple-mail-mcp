@@ -146,7 +146,16 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 
 ### Read-Only Mode
 
-Pass `--read-only` to disable tools that send email (`compose_email`, `reply_to_email`, `forward_email`). Draft management remains available (list, create, delete) but sending a draft via `manage_drafts` is blocked.
+Pass `--read-only` to restrict the server to reading mail, saving attachments and creating drafts. It is an allowlist: only these tools are registered, and any other tool, including one added in a future version, is removed at startup and refused at call time with a "blocked by --read-only" error.
+
+| Allowed under `--read-only` | Tools |
+|---|---|
+| Read | `list_accounts`, `list_account_addresses`, `list_mailboxes`, `list_inbox_emails`, `get_mailbox_unread_counts`, `get_inbox_overview`, `search_emails`, `get_email_thread`, `get_email_source`, `list_email_attachments`, `get_statistics`, `get_top_senders`, `get_awaiting_reply`, `get_needs_response`, `inbox_dashboard` |
+| Write local files only | `save_email_attachment`, `export_emails` |
+| Fetch new mail | `synchronize_account` |
+| Drafts | `create_rich_email_draft`, `manage_drafts` with `action` `create` or `list` only |
+
+Blocked: `compose_email`, `reply_to_email`, `forward_email`, `move_email`, `update_email_status`, `manage_trash` (every action), `create_mailbox`, and `manage_drafts` `send`, `open` and `delete`.
 
 ```json
 {
