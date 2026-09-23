@@ -39,7 +39,9 @@ def list_email_attachments(
         try
             set targetAccount to account "{escaped_account}"
             {inbox_mailbox_script("inboxMailbox", "targetAccount")}
-            set inboxMessages to every message of inboxMailbox
+            -- Let Mail filter by subject (one Apple Event) instead of reading
+            -- every subject in the inbox one message at a time
+            set inboxMessages to (every message of inboxMailbox whose subject contains "{escaped_keyword}")
 
             repeat with aMessage in inboxMessages
                 if resultCount >= {max_results} then exit repeat
@@ -140,6 +142,10 @@ def get_statistics(
     )
 
     if scope == "account_overview":
+        if days_back > 0:
+            overview_selection = "(every message of aMailbox whose date received > targetDate)"
+        else:
+            overview_selection = "every message of aMailbox"
         script = f'''
         tell application "Mail"
             set outputText to "╔══════════════════════════════════════════╗" & return
@@ -169,21 +175,21 @@ def get_statistics(
                         -- Skip system folders
                         if {skip_folder_checks} then
 
-                            -- Use whose clause for date pre-filtering when days_back > 0
-                            if {days_back} > 0 then
-                                set mailboxMessages to (every message of aMailbox whose date received > targetDate)
-                            else
-                                set mailboxMessages to every message of aMailbox
-                            end if
+                            -- Use whose clause for date pre-filtering when days_back > 0,
+                            -- and fetch read/flag/sender for the whole selection in one
+                            -- Apple Event each instead of one event per message.
+                            set mailboxMessages to {overview_selection}
+                            set {{readList, flaggedList, senderList}} to {{read status, flagged status, sender}} of {overview_selection}
                             set mailboxTotal to 0
 
-                            repeat with aMessage in mailboxMessages
+                            repeat with i from 1 to count of mailboxMessages
                                 try
+                                    set aMessage to item i of mailboxMessages
                                     set totalEmails to totalEmails + 1
                                     set mailboxTotal to mailboxTotal + 1
 
                                     -- Count read/unread
-                                    if read status of aMessage then
+                                    if item i of readList then
                                         set totalRead to totalRead + 1
                                     else
                                         set totalUnread to totalUnread + 1
@@ -191,7 +197,7 @@ def get_statistics(
 
                                     -- Count flagged
                                     try
-                                        if flagged status of aMessage then
+                                        if item i of flaggedList then
                                             set totalFlagged to totalFlagged + 1
                                         end if
                                     end try
@@ -203,7 +209,7 @@ def get_statistics(
                                     end if
 
                                     -- Track senders (top 10)
-                                    set messageSender to sender of aMessage
+                                    set messageSender to item i of senderList
                                     set senderFound to false
                                     repeat with senderPair in senderCounts
                                         if item 1 of senderPair is messageSender then
@@ -476,7 +482,8 @@ def export_emails(
                     end if
                 end try
 
-                set mailboxMessages to every message of targetMailbox
+                -- Let Mail filter by subject instead of reading every subject
+                set mailboxMessages to (every message of targetMailbox whose subject contains "{safe_subject_keyword}")
                 set foundMessage to missing value
 
                 -- Find the email

@@ -1,7 +1,7 @@
 """Inbox tools: listing, counting, and overview."""
 
 import json
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
@@ -45,11 +45,58 @@ def _parse_pipe_delimited_emails(raw: str) -> List[Dict[str, Any]]:
     return emails
 
 
+def _inbox_messages_script(
+    max_emails: int, include_read: bool
+) -> Tuple[str, Dict[str, str]]:
+    """Return (setup, fields) for reading the newest inbox messages of anAccount.
+
+    *setup* sets targetMessages and fetchCount (Mail orders messages newest
+    first). *fields* maps subject/sender/date/read to AppleScript expressions
+    valid inside a ``repeat with currentIndex from 1 to fetchCount`` loop
+    after ``set aMessage to item currentIndex of targetMessages``.
+
+    Mail answers one Apple Event per property read. For a bounded page the
+    loop reads the few messages it needs one by one; for max_emails=0 each
+    property is fetched for the whole inbox in a single event instead,
+    because a per-message walk over thousands of messages hits the osascript
+    timeout. Unread-only listings let Mail filter with a whose clause.
+    """
+    if include_read:
+        selection = "every message of inboxMailbox"
+    else:
+        selection = "(every message of inboxMailbox whose read status is false)"
+    setup = f"""
+                set targetMessages to {selection}
+                set fetchCount to count of targetMessages"""
+    if max_emails > 0:
+        setup += f"""
+                if fetchCount > {max_emails} then set fetchCount to {max_emails}"""
+        fields = {
+            "subject": "subject of aMessage",
+            "sender": "sender of aMessage",
+            "date": "date received of aMessage",
+            "read": "read status of aMessage",
+        }
+    else:
+        setup += f"""
+                set {{subjList, senderList, dateList, readList}} to {{subject, sender, date received, read status}} of {selection}
+                if (count of subjList) is not fetchCount or (count of readList) is not fetchCount then
+                    error "Mailbox changed while it was being read; retry."
+                end if"""
+        fields = {
+            "subject": "item currentIndex of subjList",
+            "sender": "item currentIndex of senderList",
+            "date": "item currentIndex of dateList",
+            "read": "item currentIndex of readList",
+        }
+    return setup, fields
+
+
 @mcp.tool()
 @inject_preferences
 def list_inbox_emails(
     account: Optional[str] = None,
-    max_emails: int = 0,
+    max_emails: int = 20,
     include_read: bool = True,
     include_content: bool = False,
     output_format: str = "text",
@@ -62,7 +109,8 @@ def list_inbox_emails(
 
     Args:
         account: Optional account name to filter (e.g., "Gmail", "Work"). If None, shows all accounts.
-        max_emails: Maximum number of emails to return per account (0 = all)
+        max_emails: Maximum number of most recent emails to return per account
+            (default: 20, 0 = all — slow and very large on big inboxes)
         include_read: Whether to include read emails (default: True)
         include_content: Whether to include a content preview for each email (slower, default: False)
         output_format: "text" (default, human-readable) or "json" (structured list of email dicts)
@@ -74,6 +122,11 @@ def list_inbox_emails(
     if output_format == "json":
         return _list_inbox_emails_json(account, max_emails, include_read, include_content)
 
+    escaped_account = escape_applescript(account) if account else None
+    account_filter = f'if accountName is "{escaped_account}" then' if account else ""
+    account_filter_end = "end if" if account else ""
+    inbox_setup, fields = _inbox_messages_script(max_emails, include_read)
+
     script = f"""
     tell application "Mail"
         set outputText to "INBOX EMAILS - ALL ACCOUNTS" & return & return
@@ -82,36 +135,32 @@ def list_inbox_emails(
 
         repeat with anAccount in allAccounts
             set accountName to name of anAccount
+            {account_filter}
 
             try
                 {inbox_mailbox_script("inboxMailbox", "anAccount")}
-                set inboxMessages to every message of inboxMailbox
-                set messageCount to count of inboxMessages
+                set messageCount to count of messages of inboxMailbox
+                {inbox_setup}
 
-                if messageCount > 0 then
+                if fetchCount > 0 then
                     set outputText to outputText & "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" & return
                     set outputText to outputText & "📧 ACCOUNT: " & accountName & " (" & messageCount & " messages)" & return
                     set outputText to outputText & "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" & return & return
 
-                    set currentIndex to 0
-                    repeat with aMessage in inboxMessages
-                        set currentIndex to currentIndex + 1
-                        if {max_emails} > 0 and currentIndex > {max_emails} then exit repeat
+                    repeat with currentIndex from 1 to fetchCount
+                        set aMessage to item currentIndex of targetMessages
 
                         try
-                            set messageSubject to subject of aMessage
-                            set messageSender to sender of aMessage
-                            set messageDate to date received of aMessage
-                            set messageRead to read status of aMessage
+                            set messageSubject to {fields["subject"]}
+                            set messageSender to {fields["sender"]}
+                            set messageDate to {fields["date"]}
+                            set messageRead to {fields["read"]}
                             set messageInternetId to ""
                             try
                                 set messageInternetId to message id of aMessage
                             end try
 
                             set shouldInclude to true
-                            if not {str(include_read).lower()} and messageRead then
-                                set shouldInclude to false
-                            end if
 
                             if shouldInclude then
                                 if messageRead then
@@ -143,6 +192,7 @@ def list_inbox_emails(
                 set outputText to outputText & "⚠ Error accessing inbox for account " & accountName & return
                 set outputText to outputText & "   " & errMsg & return & return
             end try
+            {account_filter_end}
         end repeat
 
         set outputText to outputText & "========================================" & return
@@ -167,6 +217,7 @@ def _list_inbox_emails_json(
     escaped_account = escape_applescript(account) if account else None
     account_filter = f'if accountName is "{escaped_account}" then' if account else ""
     account_filter_end = "end if" if account else ""
+    inbox_setup, fields = _inbox_messages_script(max_emails, include_read)
 
     script = f"""
     tell application "Mail"
@@ -177,25 +228,20 @@ def _list_inbox_emails_json(
             {account_filter}
             try
                 {inbox_mailbox_script("inboxMailbox", "anAccount")}
-                set inboxMessages to every message of inboxMailbox
-                set currentIndex to 0
-                repeat with aMessage in inboxMessages
-                    set currentIndex to currentIndex + 1
-                    if {max_emails} > 0 and currentIndex > {max_emails} then exit repeat
+                {inbox_setup}
+                repeat with currentIndex from 1 to fetchCount
+                    set aMessage to item currentIndex of targetMessages
                     try
-                        set messageSubject to subject of aMessage
-                        set messageSender to sender of aMessage
-                        set messageDate to date received of aMessage
-                        set messageRead to read status of aMessage
+                        set messageSubject to {fields["subject"]}
+                        set messageSender to {fields["sender"]}
+                        set messageDate to {fields["date"]}
+                        set messageRead to {fields["read"]}
                         set messageInternalId to (id of aMessage) as string
                         set messageInternetId to ""
                         try
                             set messageInternetId to message id of aMessage
                         end try
                         set shouldInclude to true
-                        if not {str(include_read).lower()} and messageRead then
-                            set shouldInclude to false
-                        end if
                         if shouldInclude then
                             set end of resultLines to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName & "|||" & messageInternalId & "|||" & messageInternetId
                         end if

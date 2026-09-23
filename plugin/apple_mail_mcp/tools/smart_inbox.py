@@ -102,6 +102,22 @@ def get_awaiting_reply(
                             end if
 '''
 
+    if days_back > 0:
+        inbox_fetch = (
+            "set {rawSubjects, rawSenders} to {subject, sender} of "
+            "(every message of inboxMailbox whose date received > cutoffDate)"
+        )
+        sent_fetch = (
+            "set sentMessages to (every message of sentMailbox "
+            "whose date sent > cutoffDate)"
+        )
+    else:
+        inbox_fetch = (
+            "set {rawSubjects, rawSenders} to {subject, sender} of "
+            "every message of inboxMailbox"
+        )
+        sent_fetch = "set sentMessages to every message of sentMailbox"
+
     script = f'''
     tell application "Mail"
         set outputText to "EMAILS AWAITING REPLY" & return
@@ -132,24 +148,25 @@ def get_awaiting_reply(
             -- Get Inbox mailbox
             {inbox_mailbox_script("inboxMailbox", "targetAccount")}
 
-            -- Collect subjects from inbox for matching
+            -- Collect subjects from inbox for matching. A reply cannot predate
+            -- the sent message, so only the window is read, and each property
+            -- is fetched for all messages in one Apple Event (per-message
+            -- reads over a whole inbox timed out on large mailboxes).
             set inboxSubjects to {{}}
             set inboxSenders to {{}}
-            set inboxMessages to every message of inboxMailbox
+            {inbox_fetch}
 
-            repeat with aMessage in inboxMessages
+            repeat with i from 1 to count of rawSubjects
                 try
-                    set msgSubject to subject of aMessage
-                    set msgSender to sender of aMessage
-                    set baseSubject to my stripPrefixes(msgSubject)
-                    set lowerBase to my lowercase(baseSubject)
+                    set lowerBase to my lowercase(my stripPrefixes(item i of rawSubjects))
+                    set lowerInboxSender to my lowercase(item i of rawSenders)
                     set end of inboxSubjects to lowerBase
-                    set end of inboxSenders to my lowercase(msgSender)
+                    set end of inboxSenders to lowerInboxSender
                 end try
             end repeat
 
             -- Now scan sent emails
-            set sentMessages to every message of sentMailbox
+            {sent_fetch}
             set resultCount to 0
             set checkedCount to 0
 
@@ -253,6 +270,17 @@ def get_needs_response(
 
     newsletter_condition = _newsletter_filter_condition("lowerSender")
 
+    if days_back > 0:
+        mailbox_fetch = (
+            "set mailboxMessages to (every message of targetMailbox whose "
+            "read status is false and date received > cutoffDate)"
+        )
+    else:
+        mailbox_fetch = (
+            "set mailboxMessages to (every message of targetMailbox whose "
+            "read status is false)"
+        )
+
     script = f'''
     tell application "Mail"
         set outputText to "EMAILS NEEDING RESPONSE" & return
@@ -291,21 +319,22 @@ def get_needs_response(
             end try
 
             if sentMailbox is not missing value then
-                set sentMessages to every message of sentMailbox
+                -- One Apple Event for all sent subjects, then keep the newest 200
+                set rawSentSubjects to subject of every message of sentMailbox
                 set sentIdx to 0
-                repeat with aMessage in sentMessages
+                repeat with sentSubj in rawSentSubjects
                     set sentIdx to sentIdx + 1
                     if sentIdx > 200 then exit repeat
                     try
-                        set sentSubj to subject of aMessage
-                        set baseSent to my stripPrefixes(sentSubj)
+                        set baseSent to my stripPrefixes(sentSubj as string)
                         set end of sentSubjects to my lowercase(baseSent)
                     end try
                 end repeat
             end if
 
-            -- Scan target mailbox
-            set mailboxMessages to every message of targetMailbox
+            -- Scan target mailbox: let Mail pre-filter to unread (and the date
+            -- window) instead of reading every message one by one
+            {mailbox_fetch}
             set highPriority to {{}}
             set normalPriority to {{}}
             set totalChecked to 0
@@ -445,7 +474,13 @@ def get_top_senders(
     escaped_mailbox = escape_applescript(mailbox)
 
     date_cutoff = date_cutoff_script(days_back, "cutoffDate")
-    date_check = "if messageDate < cutoffDate then exit repeat" if days_back > 0 else ""
+    if days_back > 0:
+        sender_fetch = (
+            "set mailboxSenders to sender of (every message of targetMailbox "
+            "whose date received > cutoffDate)"
+        )
+    else:
+        sender_fetch = "set mailboxSenders to sender of every message of targetMailbox"
 
     # Build the extraction key: either full sender or domain
     if group_by_domain:
@@ -503,17 +538,15 @@ def get_top_senders(
                 end if
             end try
 
-            set mailboxMessages to every message of targetMailbox
+            -- One Apple Event for every sender in the window
+            {sender_fetch}
             set senderKeys to {{}}
             set senderCounts to {{}}
             set totalAnalysed to 0
 
-            repeat with aMessage in mailboxMessages
+            repeat with rawSender in mailboxSenders
                 try
-                    set messageDate to date received of aMessage
-                    {date_check}
-
-                    set messageSender to sender of aMessage
+                    set messageSender to rawSender as string
                     set totalAnalysed to totalAnalysed + 1
 
                     {extract_key}

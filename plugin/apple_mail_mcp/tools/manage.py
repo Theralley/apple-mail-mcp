@@ -169,6 +169,20 @@ def move_email(
         date_setup = f"set cutoffDate to (current date) - ({older_than_days} * days)"
         date_cond = " and messageDate < cutoffDate"
 
+    # The same filters as a whose clause, so Mail selects the candidates in
+    # one Apple Event instead of the loop reading every message's properties
+    # (which timed out on large mailboxes). The loop re-checks condition_str.
+    whose_parts = []
+    if subject_terms:
+        whose_parts.append(contains_any_condition("subject", subject_terms))
+    if sender:
+        whose_parts.append(f'sender contains "{escape_applescript(sender)}"')
+    if only_read:
+        whose_parts.append("read status is true")
+    if date_setup:
+        whose_parts.append("date received < cutoffDate")
+    whose_clause = " and ".join(whose_parts)
+
     # dest_ref already computed at the top of the function (shared with
     # the id-based fast path).
 
@@ -196,7 +210,7 @@ def move_email(
                 {dest_setup}
                 {date_setup}
 
-                set mailboxMessages to every message of sourceMailbox
+                set mailboxMessages to (every message of sourceMailbox whose {whose_clause})
 
                 repeat with aMessage in mailboxMessages
                     if moveCount >= {max_moves} then exit repeat
@@ -301,7 +315,8 @@ def save_email_attachment(
         try
             set targetAccount to account "{escaped_account}"
             {inbox_mailbox_script("inboxMailbox", "targetAccount")}
-            set inboxMessages to every message of inboxMailbox
+            -- Let Mail filter by subject instead of reading every subject
+            set inboxMessages to (every message of inboxMailbox whose subject contains "{escaped_keyword}")
             set foundAttachment to false
 
             repeat with aMessage in inboxMessages

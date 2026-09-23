@@ -3,7 +3,7 @@
 import json
 import re
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
@@ -19,6 +19,15 @@ from apple_mail_mcp.core import (
     LOWERCASE_HANDLER,
 )
 
+
+# Seconds a body_text search may spend reading message bodies before it stops
+# and returns what it found so far (the osascript call itself is killed at 180).
+BODY_SEARCH_BUDGET_S = 120
+BODY_SEARCH_INCOMPLETE_NOTE = (
+    f"Body search stopped after {BODY_SEARCH_BUDGET_S}s before scanning every "
+    "message; results may be incomplete. Narrow it with date_from/date_to, "
+    "sender, subject_keyword or read_status."
+)
 
 MONTH_NAMES = [
     "January",
@@ -156,6 +165,7 @@ def _build_search_response(
     sort: str,
     output_format: str,
     subject_only: bool = False,
+    incomplete: bool = False,
 ) -> str:
     """Return either JSON or text for search results."""
     sorted_records = _sort_search_records(records, sort)
@@ -164,19 +174,24 @@ def _build_search_response(
     next_offset = offset + len(items) if has_more else None
 
     if output_format == "json":
-        return json.dumps(
-            {
-                "items": items,
-                "offset": offset,
-                "limit": limit,
-                "returned": len(items),
-                "has_more": has_more,
-                "next_offset": next_offset,
-                "sort": sort,
-            }
-        )
+        payload = {
+            "items": items,
+            "offset": offset,
+            "limit": limit,
+            "returned": len(items),
+            "has_more": has_more,
+            "next_offset": next_offset,
+            "sort": sort,
+        }
+        if incomplete:
+            payload["incomplete"] = True
+            payload["note"] = BODY_SEARCH_INCOMPLETE_NOTE
+        return json.dumps(payload)
 
-    return _format_search_records_text(items, subject_only=subject_only)
+    text = _format_search_records_text(items, subject_only=subject_only)
+    if incomplete:
+        text += "\n" + BODY_SEARCH_INCOMPLETE_NOTE
+    return text
 
 
 def _search_mail_records(
@@ -196,17 +211,18 @@ def _search_mail_records(
     limit: int = 100,
     sort: str = "date_desc",
     body_text: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Return structured search records from Apple Mail.
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Return (records, incomplete) from Apple Mail.
 
     When account is None, iterates all accounts.
     When body_text is provided, uses per-message iteration with case-insensitive
-    content matching (slower than subject/sender-only searches).
+    content matching (slower than subject/sender-only searches). *incomplete*
+    is True when that body scan stopped at BODY_SEARCH_BUDGET_S.
     """
     if offset < 0:
         raise ValueError("offset must be >= 0")
     if limit <= 0:
-        return []
+        return [], False
     if sort not in {"date_desc", "date_asc"}:
         raise ValueError("Invalid sort. Use: date_desc, date_asc")
     if read_status not in {"all", "read", "unread"}:
@@ -223,39 +239,40 @@ def _search_mail_records(
 
     escaped_sender = escape_applescript(sender) if sender else None
 
-    # When body_text is provided, we must iterate per-message (can't use whose clause)
+    # When body_text is provided, the body match must be checked per message
+    # (Mail's whose clause on content is as slow as reading it). Every other
+    # filter still goes into the whose clause so only candidates are read.
     use_body_search = body_text is not None
 
-    # Build whose-clause filter conditions (only used when NOT doing body search)
+    # Build whose-clause filter conditions
     filter_conditions = []
-    if not use_body_search:
-        if subject_terms:
-            filter_conditions.append(contains_any_condition("subject", subject_terms))
-        if sender:
-            filter_conditions.append(f'sender contains "{escaped_sender}"')
-        if has_attachments is not None:
-            if has_attachments:
-                filter_conditions.append("(count of mail attachments) > 0")
-            else:
-                filter_conditions.append("(count of mail attachments) = 0")
-        if flag_index is not None:
-            # flag index survives unflagging; require the active-flag boolean
-            # so residual indexes on unflagged messages don't match.
-            filter_conditions.append(
-                f"(flagged status is true and flag index is {flag_index})"
-            )
-        elif flagged is not None:
-            filter_conditions.append(
-                f"flagged status is {'true' if flagged else 'false'}"
-            )
-        if read_status == "read":
-            filter_conditions.append("read status is true")
-        elif read_status == "unread":
-            filter_conditions.append("read status is false")
-        if date_from:
-            filter_conditions.append("date received >= fromDate")
-        if date_to:
-            filter_conditions.append("date received <= toDate")
+    if subject_terms:
+        filter_conditions.append(contains_any_condition("subject", subject_terms))
+    if sender:
+        filter_conditions.append(f'sender contains "{escaped_sender}"')
+    if has_attachments is not None and not use_body_search:
+        if has_attachments:
+            filter_conditions.append("(count of mail attachments) > 0")
+        else:
+            filter_conditions.append("(count of mail attachments) = 0")
+    if flag_index is not None:
+        # flag index survives unflagging; require the active-flag boolean
+        # so residual indexes on unflagged messages don't match.
+        filter_conditions.append(
+            f"(flagged status is true and flag index is {flag_index})"
+        )
+    elif flagged is not None:
+        filter_conditions.append(
+            f"flagged status is {'true' if flagged else 'false'}"
+        )
+    if read_status == "read":
+        filter_conditions.append("read status is true")
+    elif read_status == "unread":
+        filter_conditions.append("read status is false")
+    if date_from:
+        filter_conditions.append("date received >= fromDate")
+    if date_to:
+        filter_conditions.append("date received <= toDate")
 
     if filter_conditions:
         matching_messages_script = f"set matchingMessages to every message of currentMailbox whose {' and '.join(filter_conditions)}"
@@ -310,58 +327,30 @@ def _search_mail_records(
     # Build body search per-message filter block
     if use_body_search:
         escaped_body = escape_applescript(body_text.lower()) if body_text else ""
-        # Only pay the per-message flag-index read when a flag filter needs it.
-        flag_read_script = ""
-        if flag_index is not None or flagged is not None:
-            flag_read_script = read_flag_index_script()
-        # Build per-message conditions for subject, sender, read_status, dates, attachments
         per_msg_conditions = []
-        if subject_terms:
-            # Case-insensitive subject check
-            subject_checks = " or ".join(
-                f'lowerSubject contains "{escape_applescript(t.lower())}"'
-                for t in subject_terms
-            )
-            per_msg_conditions.append(f"({subject_checks})")
-        if sender:
-            per_msg_conditions.append(f'lowerSender contains "{escape_applescript(sender.lower())}"')
-        if read_status == "read":
-            per_msg_conditions.append("messageRead is true")
-        elif read_status == "unread":
-            per_msg_conditions.append("messageRead is false")
-        if date_from:
-            per_msg_conditions.append("messageDate >= fromDate")
-        if date_to:
-            per_msg_conditions.append("messageDate <= toDate")
         if has_attachments is True:
             per_msg_conditions.append("(count of mail attachments of aMessage) > 0")
         elif has_attachments is False:
             per_msg_conditions.append("(count of mail attachments of aMessage) = 0")
-        if flag_index is not None:
-            per_msg_conditions.append(f"messageFlagIndex is {flag_index}")
-        elif flagged is True:
-            per_msg_conditions.append("messageFlagIndex is not -1")
-        elif flagged is False:
-            per_msg_conditions.append("messageFlagIndex is -1")
 
         # Body text condition is always present in body search mode
         per_msg_conditions.append(f'lowerContent contains "{escaped_body}"')
 
         combined_condition = " and ".join(per_msg_conditions)
 
+        # Reading a body costs Mail one to several seconds, so the scan stops
+        # at BODY_SEARCH_BUDGET_S and reports partial results instead of
+        # running into the osascript timeout.
         body_search_loop = f'''
+                            {matching_messages_script.replace("set matchingMessages to", "set candidateMessages to")}
                             set matchingMessages to {{}}
-                            set allMessages to every message of currentMailbox
-                            repeat with aMessage in allMessages
-                                if collectLimit <= 0 then exit repeat
+                            repeat with aMessage in candidateMessages
+                                if (count of matchingMessages) >= (offsetRemaining + collectLimit) then exit repeat
+                                if ((current date) - searchStartedAt) > {BODY_SEARCH_BUDGET_S} then
+                                    set searchIncomplete to true
+                                    exit repeat
+                                end if
                                 try
-                                    set messageSubject to subject of aMessage
-                                    set messageSender to sender of aMessage
-                                    set messageRead to read status of aMessage
-                                    set messageDate to date received of aMessage
-                                    {flag_read_script}
-                                    set lowerSubject to my lowercase(messageSubject)
-                                    set lowerSender to my lowercase(messageSender)
                                     set msgContent to ""
                                     try
                                         set msgContent to content of aMessage
@@ -439,6 +428,8 @@ def _search_mail_records(
                 set recordLines to {{}}
                 set offsetRemaining to {offset}
                 set collectLimit to {limit + 1}
+                set searchStartedAt to current date
+                set searchIncomplete to false
                 {date_setup}
                 {account_setup}
 
@@ -528,6 +519,10 @@ def _search_mail_records(
                     end repeat
                 end repeat
 
+                if searchIncomplete then
+                    set end of recordLines to "INCOMPLETE|||body search time budget reached"
+                end if
+
                 if (count of recordLines) is 0 then
                     return ""
                 end if
@@ -547,7 +542,8 @@ def _search_mail_records(
     if result.startswith("ERROR|||"):
         raise ValueError(result.split("|||", 1)[1])
 
-    return _parse_search_records(result)
+    incomplete = "INCOMPLETE|||" in result
+    return _parse_search_records(result), incomplete
 
 
 @mcp.tool()
@@ -615,7 +611,7 @@ def search_emails(
     subject_terms = normalize_search_terms(subject_keyword, subject_keywords)
 
     try:
-        records = _search_mail_records(
+        records, incomplete = _search_mail_records(
             account=account,
             mailbox=mailbox,
             subject_terms=subject_terms,
@@ -640,6 +636,7 @@ def search_emails(
             sort=sort,
             output_format=output_format,
             subject_only=False,
+            incomplete=incomplete,
         )
     except ValueError as exc:
         return f"Error: {exc}"
@@ -705,9 +702,13 @@ def get_email_thread(
             set targetAccount to account "{escaped_account}"
             {mailbox_script}
 
-            -- Collect all matching messages from all mailboxes
+            -- Collect all matching messages from all mailboxes. Stripping a
+            -- Re:/Fwd: prefix only shortens the subject, so a subject matches
+            -- exactly when it contains the keyword: let Mail filter with a
+            -- whose clause instead of reading every subject one event at a time.
             repeat with currentMailbox in searchMailboxes
-                set mailboxMessages to every message of currentMailbox
+                if (count of threadMessages) >= {max_messages} then exit repeat
+                set mailboxMessages to (every message of currentMailbox whose subject contains "{escaped_keyword}")
 
                 repeat with aMessage in mailboxMessages
                     if (count of threadMessages) >= {max_messages} then exit repeat

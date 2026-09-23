@@ -205,7 +205,13 @@ def run_applescript(script: str, timeout: int = 120) -> str:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-        raise Exception("AppleScript execution timed out")
+        raise Exception(
+            f"AppleScript execution timed out after {timeout}s: Mail.app did not "
+            "answer in time. Large mailboxes, content/body reads, or other "
+            "clients automating Mail at the same time are the usual cause. "
+            "Narrow the request (account, mailbox, date range, max results) "
+            "and retry."
+        )
     except Exception as e:
         raise Exception(f"AppleScript execution failed: {str(e)}")
     finally:
@@ -324,9 +330,27 @@ def parse_email_list(output: str) -> List[Dict[str, Any]]:
 # Shared AppleScript template helpers
 # ---------------------------------------------------------------------------
 
+# Pure AppleScript: the previous `do shell script ... | tr` version forked a
+# shell per call (~8 ms each), which dominated tools that lowercase every
+# message in a large mailbox and pushed them past the osascript timeout.
 LOWERCASE_HANDLER = """
     on lowercase(str)
-        set lowerStr to do shell script "echo " & quoted form of str & " | tr '[:upper:]' '[:lower:]'"
+        set upperChars to "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ"
+        set lowerChars to "abcdefghijklmnopqrstuvwxyzàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþ"
+        set savedDelimiters to AppleScript's text item delimiters
+        set lowerStr to str as text
+        considering case
+            repeat with i from 1 to length of upperChars
+                set upperChar to character i of upperChars
+                if lowerStr contains upperChar then
+                    set AppleScript's text item delimiters to upperChar
+                    set textParts to text items of lowerStr
+                    set AppleScript's text item delimiters to character i of lowerChars
+                    set lowerStr to textParts as text
+                end if
+            end repeat
+        end considering
+        set AppleScript's text item delimiters to savedDelimiters
         return lowerStr
     end lowercase
 """

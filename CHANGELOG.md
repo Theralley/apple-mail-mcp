@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Timeouts on large mailboxes.** Mail answers one Apple Event per property
+  read, so tools that walked a whole mailbox message by message ran into the
+  120 s osascript kill on inboxes with thousands of messages. On a
+  7,018-message inbox, `list_inbox_emails()` (default: all messages),
+  `get_awaiting_reply` and `search_emails(body_text=...)` timed out, and
+  `get_email_thread` and `get_statistics` took 70 to 90 s. These tools now
+  pre-filter with `whose` clauses (subject, unread, date window) and fetch
+  each property for a whole selection in one Apple Event:
+  - `list_inbox_emails` defaults to the 20 newest messages per account
+    (`max_emails=0` still returns everything). The text output now honours
+    `account`, and `include_read=False` returns the N newest unread messages
+    instead of the unread subset of the N newest.
+  - `get_awaiting_reply` reads only inbox and sent mail inside `days_back`.
+  - `get_needs_response`, `get_top_senders`, `get_email_thread`,
+    `list_email_attachments`, `save_email_attachment`, `export_emails`
+    (single email), `move_email` and `get_statistics` use filtered or bulk
+    reads.
+  - `search_emails(body_text=...)` applies every other filter in the `whose`
+    clause first. It stops reading bodies after 120 s and marks the result as
+    incomplete (`"incomplete": true` in JSON) instead of failing with a
+    timeout.
+  - The shared `lowercase` AppleScript handler no longer forks a shell per
+    call (about 8 ms each, per message).
+  - A timeout now returns an actionable error that states the limit and how
+    to narrow the request.
 - Removed the redundant `plugin/commands/email-management.md` slash command.
   It shadowed `plugin/skills/email-management/` under the same
   `apple-mail:email-management` listing key, so every session showed two
