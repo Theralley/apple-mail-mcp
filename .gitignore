@@ -30,6 +30,7 @@ ENV/
 
 # MCP Development
 .mcp.json
+uv.lock
 .claude/settings.local.json
 .claude/worktrees/
 docs/superpowers/plans/
