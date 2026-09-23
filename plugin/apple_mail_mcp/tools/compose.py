@@ -9,7 +9,8 @@ from html import escape as html_escape
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-from apple_mail_mcp.server import mcp, READ_ONLY
+from apple_mail_mcp import server
+from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
     inject_preferences,
     escape_applescript,
@@ -1545,7 +1546,10 @@ def manage_drafts(
         '''
 
     elif action == "send":
-        if READ_ONLY:
+        # Read the flag at call time: this module is imported (via the
+        # package __init__) before __main__ sets server.READ_ONLY, so a
+        # value imported at module level is always False.
+        if server.READ_ONLY:
             return "Error: Sending drafts is disabled in read-only mode."
         if not draft_subject:
             return "Error: 'draft_subject' is required for sending drafts"

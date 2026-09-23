@@ -900,5 +900,25 @@ class PasteboardUtf8EncodingTests(unittest.TestCase):
         self.assertIn("dictionaryWithObjects:", snippet)
 
 
+
+class ManageDraftsReadOnlyTests(unittest.TestCase):
+    def test_send_is_refused_when_read_only_is_set_after_import(self):
+        """__main__ sets server.READ_ONLY after the tool modules are imported;
+        the send guard must read the flag at call time."""
+        from apple_mail_mcp import server
+
+        original = server.READ_ONLY
+        server.READ_ONLY = True
+        try:
+            with patch.object(compose_tools, "run_applescript") as run:
+                result = compose_tools.manage_drafts(
+                    account="Work", action="send", draft_subject="Anything"
+                )
+        finally:
+            server.READ_ONLY = original
+
+        self.assertIn("disabled in read-only mode", result)
+        run.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

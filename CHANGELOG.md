@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     call (about 8 ms each, per message).
   - A timeout now returns an actionable error that states the limit and how
     to narrow the request.
+- `--read-only` now also blocks `manage_drafts(action="send")`. The guard
+  read a `READ_ONLY` value that was imported before `main()` set it, so it
+  was always `False` and read-only mode still sent drafts.
 - Removed the redundant `plugin/commands/email-management.md` slash command.
   It shadowed `plugin/skills/email-management/` under the same
   `apple-mail:email-management` listing key, so every session showed two
