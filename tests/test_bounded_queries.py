@@ -212,7 +212,7 @@ class SubjectPrefilterTests(unittest.TestCase):
             analytics_tools.get_statistics(account="Work")
 
         self.assertIn(
-            "{read status, flagged status, sender} of "
+            "{id, read status, flagged status, sender} of "
             "(every message of aMailbox whose date received > targetDate)",
             captured["script"],
         )

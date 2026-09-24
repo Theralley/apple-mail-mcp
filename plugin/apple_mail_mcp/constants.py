@@ -27,6 +27,27 @@ SKIP_FOLDERS = [
     "Papierkorb", "Gesendet", "Entwürfe", "Werbung",
     # Spanish
     "Papelera", "Enviados", "Borradores", "Correo no deseado",
+    # Swedish (Exchange/Outlook + Gmail SV)
+    "Skickat", "Skickade meddelanden", "Papperskorgen", "Borttagna objekt",
+    "Skräppost", "Utkast",
+    # Gmail's English sent folder
+    "Sent Mail",
+]
+
+# Names of an account's Sent mailbox, tried in this order. The first three
+# are the ones the tools always tried; Gmail and localised accounts use the
+# others ("[Gmail]/Skickat" is shown by Mail as a top-level "Skickat").
+SENT_MAILBOX_NAMES = [
+    "Sent Messages", "Sent", "Sent Items", "Sent Mail",
+    "Skickat", "Skickade meddelanden",
+    "Éléments envoyés", "Messages envoyés", "Gesendet", "Enviados",
+]
+
+# Names of Gmail's "All Mail", which holds every message that also appears in
+# INBOX and other label mailboxes. A search over all mailboxes lists such a
+# message once, under its label mailbox rather than here.
+ALL_MAIL_NAMES = [
+    "All Mail", "All e-post", "Alle Nachrichten", "Tous les messages", "Todos",
 ]
 
 # Apple Mail flag colors -> AppleScript `flag index` values.

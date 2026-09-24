@@ -853,5 +853,96 @@ class BodySearchDeadlineTests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["content_preview"], "the invoice text")
 
 
+class SharedDecisionTests(unittest.TestCase):
+    """The AppleScript path makes the same choices as the Envelope Index path."""
+
+    def test_all_mailboxes_lists_a_gmail_message_once_under_its_label(self):
+        scripts = []
+
+        def fake_run(script, timeout=120):
+            scripts.append(script)
+            if "set idList to" in script:
+                return RECORD_SEP.join([
+                    FIELD_SEP.join(["Gmail", "All e-post", "5,6"]),
+                    FIELD_SEP.join(["Gmail", "INBOX", "5"]),
+                ])
+            return RECORD_SEP.join([
+                _record_line(5, "Hi", mailbox="All e-post", account="Gmail"),
+                _record_line(5, "Hi", mailbox="INBOX", account="Gmail"),
+                _record_line(6, "Archived", mailbox="All e-post", account="Gmail"),
+            ])
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
+            payload = json.loads(search_tools.search_emails(account="Gmail", mailbox="All", output_format="json"))
+
+        self.assertEqual(
+            [(i["message_id"], i["mailbox"]) for i in payload["items"]], [("5", "INBOX"), ("6", "All e-post")]
+        )
+        self.assertIn('"Papperskorgen"', scripts[0])  # Swedish Trash is skipped
+        self.assertIn('"Skickat"', scripts[0])
+        self.assertIn("(id is 5 or id is 6)", scripts[1])
+        self.assertIn("set collectLimit to 4", scripts[1])  # both copies of 5 can arrive
+
+    def test_statistics_count_each_message_once(self):
+        from apple_mail_mcp.tools import analytics as analytics_tools
+
+        def message(message_id, read, flagged, attachments, sender):
+            return FIELD_SEP.join(["MESSAGE", message_id, read, flagged, attachments, sender])
+
+        output = RECORD_SEP.join([
+            FIELD_SEP.join(["MAILBOX", "INBOX"]),
+            message("5", "false", "true", "1", "Eve <eve@example.org>"),
+            FIELD_SEP.join(["MAILBOX", "All e-post"]),
+            message("5", "false", "true", "1", "Eve <eve@example.org>"),
+            message("6", "true", "false", "0", "eve <EVE@example.org>"),
+            FIELD_SEP.join(["MAILBOX", "Empty"]),
+        ])
+        with patch("apple_mail_mcp.tools.analytics.run_applescript", return_value=output) as run:
+            overview = analytics_tools.get_statistics(account="Gmail", days_back=0)
+        script = run.call_args.args[0]
+        self.assertIn('mailboxName is not "Papperskorgen"', script)
+        self.assertIn('mailboxName is not "Skickat"', script)
+        self.assertIn(
+            "Total Emails: 2\nUnread: 1 (50%)\nRead: 1 (50%)\nFlagged: 1\nWith Attachments: 1 (50%)\n", overview
+        )
+        self.assertIn("Eve <eve@example.org>: 2 emails\n", overview)  # senders compared ignoring case
+        self.assertIn("INBOX: 1 (50%)\nAll e-post: 2 (100%)", overview)
+        self.assertNotIn("Empty", overview)
+
+        sender_output = RECORD_SEP.join([
+            FIELD_SEP.join(["MAILBOX", "INBOX"]),
+            message("5", "false", "false", "1", ""),
+            FIELD_SEP.join(["MAILBOX", "All e-post"]),
+            message("5", "false", "false", "1", ""),
+            message("6", "true", "false", "0", ""),
+        ])
+        with patch("apple_mail_mcp.tools.analytics.run_applescript", return_value=sender_output):
+            stats = analytics_tools.get_statistics(account="Gmail", scope="sender_stats", sender="eve")
+        self.assertEqual(
+            stats,
+            "SENDER STATISTICS\n\nSender: eve\nAccount: Gmail\n\nTotal emails: 2\nUnread: 1\nWith attachments: 1",
+        )
+
+    def test_statistics_script_errors_pass_through(self):
+        from apple_mail_mcp.tools import analytics as analytics_tools
+
+        with patch("apple_mail_mcp.tools.analytics.run_applescript", return_value="Error: no account"):
+            self.assertEqual(analytics_tools.get_statistics(account="Nope"), "Error: no account")
+
+    def test_sent_mailbox_lookup_knows_localised_names(self):
+        scripts = []
+
+        def fake_run(script, timeout=120):
+            scripts.append(script)
+            return "EMAILS"
+
+        with patch("apple_mail_mcp.tools.smart_inbox.run_applescript", side_effect=fake_run):
+            smart_inbox_tools.get_awaiting_reply(account="Gmail")
+            smart_inbox_tools.get_needs_response(account="Gmail")
+        for script in scripts:
+            self.assertIn('repeat with sentName in {"Sent Messages", "Sent", "Sent Items", "Sent Mail", "Skickat"', script)
+        self.assertIn('return "Error: Could not find Sent mailbox for account Gmail"', scripts[0])
+
+
 if __name__ == "__main__":
     unittest.main()

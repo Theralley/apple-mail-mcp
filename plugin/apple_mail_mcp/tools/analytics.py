@@ -1,7 +1,7 @@
 """Analytics tools: attachments, statistics, exports, and dashboard."""
 
 import os
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, NamedTuple, Tuple
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp import envelope_index
@@ -155,7 +155,7 @@ def get_statistics(
 
     # Build skip folders condition from constants
     skip_folder_checks = ' and '.join(
-        f'mailboxName is not "{f}"' for f in SKIP_FOLDERS
+        f'mailboxName is not "{escape_applescript(f)}"' for f in SKIP_FOLDERS
     )
 
     if scope == "account_overview":
@@ -163,143 +163,45 @@ def get_statistics(
             overview_selection = "(every message of aMailbox whose date received > targetDate)"
         else:
             overview_selection = "every message of aMailbox"
+        # One record per message; the report is built in Python
+        # (_account_overview_report), which counts each message once.
         script = f'''
         tell application "Mail"
-            set outputText to "╔══════════════════════════════════════════╗" & return
-            set outputText to outputText & "║      EMAIL STATISTICS - {escaped_account}       ║" & return
-            set outputText to outputText & "╚══════════════════════════════════════════╝" & return & return
-
             {date_filter}
 
             try
                 set targetAccount to account "{escaped_account}"
-                set allMailboxes to every mailbox of targetAccount
+                set fs to {AS_FIELD_SEP}
+                set outLines to {{}}
 
-                -- Initialize counters
-                set totalEmails to 0
-                set totalUnread to 0
-                set totalRead to 0
-                set totalFlagged to 0
-                set totalWithAttachments to 0
-                set senderCounts to {{}}
-                set mailboxCounts to {{}}
-
-                -- Analyze all mailboxes
-                repeat with aMailbox in allMailboxes
+                repeat with aMailbox in (every mailbox of targetAccount)
                     try
                         set mailboxName to name of aMailbox
 
                         -- Skip system folders
                         if {skip_folder_checks} then
-
-                            -- Use whose clause for date pre-filtering when days_back > 0,
-                            -- and fetch read/flag/sender for the whole selection in one
-                            -- Apple Event each instead of one event per message.
                             set mailboxMessages to {overview_selection}
-                            set {{readList, flaggedList, senderList}} to {{read status, flagged status, sender}} of {overview_selection}
-                            set mailboxTotal to 0
-
+                            set {{idList, readList, flaggedList, senderList}} to {{id, read status, flagged status, sender}} of {overview_selection}
+                            set end of outLines to "MAILBOX" & fs & mailboxName
                             repeat with i from 1 to count of mailboxMessages
                                 try
-                                    set aMessage to item i of mailboxMessages
-                                    set totalEmails to totalEmails + 1
-                                    set mailboxTotal to mailboxTotal + 1
-
-                                    -- Count read/unread
-                                    if item i of readList then
-                                        set totalRead to totalRead + 1
-                                    else
-                                        set totalUnread to totalUnread + 1
-                                    end if
-
-                                    -- Count flagged
-                                    try
-                                        if item i of flaggedList then
-                                            set totalFlagged to totalFlagged + 1
-                                        end if
-                                    end try
-
-                                    -- Count attachments
-                                    set attachmentCount to count of mail attachments of aMessage
-                                    if attachmentCount > 0 then
-                                        set totalWithAttachments to totalWithAttachments + 1
-                                    end if
-
-                                    -- Track senders (top 10)
-                                    set messageSender to item i of senderList
-                                    set senderFound to false
-                                    repeat with senderPair in senderCounts
-                                        if item 1 of senderPair is messageSender then
-                                            set item 2 of senderPair to (item 2 of senderPair) + 1
-                                            set senderFound to true
-                                            exit repeat
-                                        end if
-                                    end repeat
-                                    if not senderFound then
-                                        set end of senderCounts to {{messageSender, 1}}
-                                    end if
+                                    set attachmentCount to count of mail attachments of item i of mailboxMessages
+                                    set end of outLines to "MESSAGE" & fs & (item i of idList as string) & fs & (item i of readList as string) & fs & (item i of flaggedList as string) & fs & (attachmentCount as string) & fs & (item i of senderList as string)
                                 end try
                             end repeat
-
-                            -- Store mailbox counts
-                            if mailboxTotal > 0 then
-                                set end of mailboxCounts to {{mailboxName, mailboxTotal}}
-                            end if
-
                         end if
                     on error
                         -- Skip mailboxes that throw errors (smart mailboxes, etc.)
                     end try
                 end repeat
 
-                -- Format output
-                set outputText to outputText & "📊 VOLUME METRICS" & return
-                set outputText to outputText & "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" & return
-                set outputText to outputText & "Total Emails: " & totalEmails & return
-                if totalEmails > 0 then
-                    set outputText to outputText & "Unread: " & totalUnread & " (" & (round ((totalUnread / totalEmails) * 100)) & "%)" & return
-                    set outputText to outputText & "Read: " & totalRead & " (" & (round ((totalRead / totalEmails) * 100)) & "%)" & return
-                    set outputText to outputText & "Flagged: " & totalFlagged & return
-                    set outputText to outputText & "With Attachments: " & totalWithAttachments & " (" & (round ((totalWithAttachments / totalEmails) * 100)) & "%)" & return
-                else
-                    set outputText to outputText & "Unread: 0" & return
-                    set outputText to outputText & "Read: 0" & return
-                    set outputText to outputText & "Flagged: 0" & return
-                    set outputText to outputText & "With Attachments: 0" & return
-                end if
-                set outputText to outputText & return
-
-                -- Top senders (show top 5)
-                set outputText to outputText & "👥 TOP SENDERS" & return
-                set outputText to outputText & "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" & return
-                set topCount to 0
-                repeat with senderPair in senderCounts
-                    set topCount to topCount + 1
-                    if topCount > 5 then exit repeat
-                    set outputText to outputText & item 1 of senderPair & ": " & item 2 of senderPair & " emails" & return
-                end repeat
-                set outputText to outputText & return
-
-                -- Mailbox distribution (show top 5)
-                set outputText to outputText & "📁 MAILBOX DISTRIBUTION" & return
-                set outputText to outputText & "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" & return
-                set topCount to 0
-                repeat with mailboxPair in mailboxCounts
-                    set topCount to topCount + 1
-                    if topCount > 5 then exit repeat
-                    if totalEmails > 0 then
-                        set mailboxPercent to round ((item 2 of mailboxPair / totalEmails) * 100)
-                        set outputText to outputText & item 1 of mailboxPair & ": " & item 2 of mailboxPair & " (" & mailboxPercent & "%)" & return
-                    else
-                        set outputText to outputText & item 1 of mailboxPair & ": " & item 2 of mailboxPair & return
-                    end if
-                end repeat
-
+                set AppleScript's text item delimiters to {AS_RECORD_SEP}
+                set outputText to outLines as string
+                set AppleScript's text item delimiters to ""
+                return outputText
             on error errMsg
                 return "Error: " & errMsg
             end try
-
-            return outputText
         end tell
         '''
 
@@ -315,59 +217,39 @@ def get_statistics(
 
         script = f'''
         tell application "Mail"
-            set outputText to "SENDER STATISTICS" & return & return
-            set outputText to outputText & "Sender: {escaped_sender}" & return
-            set outputText to outputText & "Account: {escaped_account}" & return & return
-
             {date_filter}
 
             try
                 set targetAccount to account "{escaped_account}"
-                set allMailboxes to every mailbox of targetAccount
+                set fs to {AS_FIELD_SEP}
+                set outLines to {{}}
 
-                set totalFromSender to 0
-                set unreadFromSender to 0
-                set withAttachments to 0
-
-                repeat with aMailbox in allMailboxes
+                repeat with aMailbox in (every mailbox of targetAccount)
                     try
                         set mailboxName to name of aMailbox
 
                         -- Skip system folders
                         if {skip_folder_checks} then
-
-                            -- Use whose clause for fast app-level filtering
                             set matchedMessages to (every message of aMailbox whose {whose_clause})
-
+                            set end of outLines to "MAILBOX" & fs & mailboxName
                             repeat with aMessage in matchedMessages
                                 try
-                                    set totalFromSender to totalFromSender + 1
-
-                                    if not (read status of aMessage) then
-                                        set unreadFromSender to unreadFromSender + 1
-                                    end if
-
-                                    if (count of mail attachments of aMessage) > 0 then
-                                        set withAttachments to withAttachments + 1
-                                    end if
+                                    set end of outLines to "MESSAGE" & fs & ((id of aMessage) as string) & fs & ((read status of aMessage) as string) & fs & "false" & fs & ((count of mail attachments of aMessage) as string) & fs & ""
                                 end try
                             end repeat
-
                         end if
                     on error
                         -- Skip mailboxes that throw errors (smart mailboxes, etc.)
                     end try
                 end repeat
 
-                set outputText to outputText & "Total emails: " & totalFromSender & return
-                set outputText to outputText & "Unread: " & unreadFromSender & return
-                set outputText to outputText & "With attachments: " & withAttachments & return
-
+                set AppleScript's text item delimiters to {AS_RECORD_SEP}
+                set outputText to outLines as string
+                set AppleScript's text item delimiters to ""
+                return outputText
             on error errMsg
                 return "Error: " & errMsg
             end try
-
-            return outputText
         end tell
         '''
 
@@ -412,7 +294,12 @@ def get_statistics(
         return f"Error: Invalid scope '{scope}'. Use: account_overview, sender_stats, mailbox_breakdown"
 
     result = run_applescript(script)
-    return result
+    if scope == "mailbox_breakdown" or result.startswith("Error:"):
+        return result
+    mailboxes = _parse_statistics_rows(result)
+    if scope == "account_overview":
+        return _account_overview_report(account, mailboxes)
+    return _sender_stats_report(account, sender, mailboxes)
 
 
 @mcp.tool()
@@ -824,80 +711,20 @@ def _statistics_from_index(account, scope, sender, mailbox, days_back) -> str:
     index = envelope_index.get_index()
     cutoff = envelope_index.days_back_cutoff(days_back)
 
-    # A Gmail message is in All Mail and in each mailbox it is labelled with,
-    # which are all top-level mailboxes here. The scripts count it once per
-    # mailbox; these totals count each message once (`seen`).
-    seen: set = set()
-
-    if scope == "account_overview":
-        total = unread = flagged = with_attachments = 0
-        senders: list = []  # [sender, count], first seen first, as the script keeps them
-        sender_slot: dict = {}
-        mailbox_counts = []
+    if scope in ("account_overview", "sender_stats"):
+        mailboxes = []
         for mailbox_name, box in _counted_mailboxes(index, account):
-            messages = index.messages([box.id], received_after=cutoff)
-            attached = index.with_attachments(m.id for m in messages)
-            if messages:
-                mailbox_counts.append((mailbox_name, len(messages)))
-            for message in messages:
-                if message.id in seen:
-                    continue
-                seen.add(message.id)
-                total += 1
-                if not message.read:
-                    unread += 1
-                if message.flagged:
-                    flagged += 1
-                if message.id in attached:
-                    with_attachments += 1
-                key = fold(message.sender)
-                if key in sender_slot:
-                    senders[sender_slot[key]][1] += 1
-                else:
-                    sender_slot[key] = len(senders)
-                    senders.append([message.sender, 1])
-        read = total - unread
-
-        out = "╔══════════════════════════════════════════╗\n"
-        out += f"║      EMAIL STATISTICS - {account}       ║\n"
-        out += "╚══════════════════════════════════════════╝\n\n"
-        out += f"📊 VOLUME METRICS\n{RULE}\n"
-        out += f"Total Emails: {total}\n"
-        if total > 0:
-            out += f"Unread: {unread} ({_percent(unread, total)}%)\n"
-            out += f"Read: {read} ({_percent(read, total)}%)\n"
-            out += f"Flagged: {flagged}\n"
-            out += f"With Attachments: {with_attachments} ({_percent(with_attachments, total)}%)\n"
-        else:
-            out += "Unread: 0\nRead: 0\nFlagged: 0\nWith Attachments: 0\n"
-        out += "\n"
-        out += f"👥 TOP SENDERS\n{RULE}\n"
-        for name, count in senders[:5]:
-            out += f"{name}: {count} emails\n"
-        out += "\n"
-        out += f"📁 MAILBOX DISTRIBUTION\n{RULE}\n"
-        for name, count in mailbox_counts[:5]:
-            if total > 0:
-                out += f"{name}: {count} ({_percent(count, total)}%)\n"
+            if scope == "account_overview":
+                messages = index.messages([box.id], received_after=cutoff)
             else:
-                out += f"{name}: {count}\n"
-        return clean_script_output(out)
-
-    if scope == "sender_stats":
-        total = unread = with_attachments = 0
-        for _, box in _counted_mailboxes(index, account):
-            messages = [
-                m for m in index.messages([box.id], sender_contains=sender, received_after=cutoff)
-                if m.id not in seen
-            ]
-            seen.update(m.id for m in messages)
+                messages = index.messages([box.id], sender_contains=sender, received_after=cutoff)
             attached = index.with_attachments(m.id for m in messages)
-            total += len(messages)
-            unread += sum(1 for m in messages if not m.read)
-            with_attachments += sum(1 for m in messages if m.id in attached)
-        out = f"SENDER STATISTICS\n\nSender: {sender}\nAccount: {account}\n\n"
-        out += f"Total emails: {total}\nUnread: {unread}\nWith attachments: {with_attachments}\n"
-        return clean_script_output(out)
+            mailboxes.append((mailbox_name, [
+                StatRow(str(m.id), m.read, m.flagged, m.id in attached, m.sender) for m in messages
+            ]))
+        if scope == "account_overview":
+            return _account_overview_report(account, mailboxes)
+        return _sender_stats_report(account, sender, mailboxes)
 
     mailbox_param = mailbox if mailbox else "INBOX"
     box = envelope_index.resolve_mailbox(index, envelope_index.account_uuid(account), mailbox_param)
@@ -927,3 +754,101 @@ def _recent_emails_from_index(max_total: int, max_per_account: int) -> List[Dict
         }
         for name, message in rows
     ]
+
+
+class StatRow(NamedTuple):
+    """One message as the statistics see it."""
+
+    id: str
+    read: bool
+    flagged: bool
+    has_attachments: bool
+    sender: str
+
+
+def _parse_statistics_rows(output: str) -> List[Tuple[str, List[StatRow]]]:
+    """[(mailbox name, [StatRow])] from the statistics scripts' records."""
+    mailboxes: List[Tuple[str, List[StatRow]]] = []
+    for record in output.split(RECORD_SEP):
+        parts = record.split(FIELD_SEP)
+        if parts[0] == "MAILBOX" and len(parts) >= 2:
+            mailboxes.append((FIELD_SEP.join(parts[1:]), []))
+        elif parts[0] == "MESSAGE" and len(parts) >= 6 and mailboxes:
+            _, message_id, read, flagged, attachments, *sender = parts
+            mailboxes[-1][1].append(StatRow(
+                message_id.strip(),
+                read.strip() == "true",
+                flagged.strip() == "true",
+                attachments.strip() not in ("", "0"),
+                FIELD_SEP.join(sender),
+            ))
+    return mailboxes
+
+
+# A Gmail message is in All Mail and in every mailbox it is labelled with,
+# which are all top-level mailboxes. The statistics count each message once
+# (by id); the mailbox distribution still gives each mailbox its own count.
+
+
+def _account_overview_report(account: str, mailboxes: List[Tuple[str, List[StatRow]]]) -> str:
+    seen: set = set()
+    total = unread = flagged = with_attachments = 0
+    senders: list = []  # [sender, count] in the order first seen
+    sender_slot: dict = {}
+    mailbox_counts = []
+    for mailbox_name, rows in mailboxes:
+        if rows:
+            mailbox_counts.append((mailbox_name, len(rows)))
+        for row in rows:
+            if row.id in seen:
+                continue
+            seen.add(row.id)
+            total += 1
+            if not row.read:
+                unread += 1
+            if row.flagged:
+                flagged += 1
+            if row.has_attachments:
+                with_attachments += 1
+            key = fold(row.sender)
+            if key in sender_slot:
+                senders[sender_slot[key]][1] += 1
+            else:
+                sender_slot[key] = len(senders)
+                senders.append([row.sender, 1])
+    read = total - unread
+
+    out = "╔══════════════════════════════════════════╗\n"
+    out += f"║      EMAIL STATISTICS - {account}       ║\n"
+    out += "╚══════════════════════════════════════════╝\n\n"
+    out += f"📊 VOLUME METRICS\n{RULE}\n"
+    out += f"Total Emails: {total}\n"
+    if total > 0:
+        out += f"Unread: {unread} ({_percent(unread, total)}%)\n"
+        out += f"Read: {read} ({_percent(read, total)}%)\n"
+        out += f"Flagged: {flagged}\n"
+        out += f"With Attachments: {with_attachments} ({_percent(with_attachments, total)}%)\n"
+    else:
+        out += "Unread: 0\nRead: 0\nFlagged: 0\nWith Attachments: 0\n"
+    out += "\n"
+    out += f"👥 TOP SENDERS\n{RULE}\n"
+    for name, count in senders[:5]:
+        out += f"{name}: {count} emails\n"
+    out += "\n"
+    out += f"📁 MAILBOX DISTRIBUTION\n{RULE}\n"
+    for name, count in mailbox_counts[:5]:
+        if total > 0:
+            out += f"{name}: {count} ({_percent(count, total)}%)\n"
+        else:
+            out += f"{name}: {count}\n"
+    return clean_script_output(out)
+
+
+def _sender_stats_report(account: str, sender: str, mailboxes: List[Tuple[str, List[StatRow]]]) -> str:
+    distinct = {row.id: row for _, rows in mailboxes for row in rows}
+    total = len(distinct)
+    unread = sum(1 for row in distinct.values() if not row.read)
+    with_attachments = sum(1 for row in distinct.values() if row.has_attachments)
+    out = f"SENDER STATISTICS\n\nSender: {sender}\nAccount: {account}\n\n"
+    out += f"Total emails: {total}\nUnread: {unread}\nWith attachments: {with_attachments}\n"
+    return clean_script_output(out)

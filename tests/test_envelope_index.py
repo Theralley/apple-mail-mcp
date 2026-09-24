@@ -52,12 +52,16 @@ MAILBOXES = [
     (11, "imap://UUID-G/INBOX"),
     (12, "imap://UUID-G/Kva%CC%88tton"),  # "Kvätton" with a decomposed "ä"
     (13, "imap://UUID-G/Notes"),
+    (14, "imap://UUID-G/%5BGmail%5D/Skickat"),  # Sent, a label mailbox of All Mail
+    (15, "imap://UUID-G/%5BGmail%5D/Papperskorgen"),  # Trash
 ]
+SOURCES = {11: 10, 13: 10, 14: 10}  # mailboxes.source: label mailbox -> All Mail
 ACCOUNTS = [("Work", "UUID-W"), ("Gmail", "UUID-G")]
 TREE = [
     ("Work", [("Inbox", ["Projects"]), ("Sent Items", []), ("Deleted Items", []), ("Archive", [])]),
     # Mail lists the children of "[Gmail]" as top-level mailboxes
-    ("Gmail", [("INBOX", []), ("All Mail", []), ("Kvätton", []), ("Notes", [])]),
+    ("Gmail", [("INBOX", []), ("All Mail", []), ("Kvätton", []), ("Notes", []),
+               ("Skickat", []), ("Papperskorgen", [])]),
 ]
 ADDRESSES = {
     "alice": ("alice@example.com", "Alice"),
@@ -87,17 +91,23 @@ MESSAGES = [
     (1003, "eve", None, "Deleted label", NOW - 5, NOW - 5, 10, 0, 0, 0, 1, "<e3@example.org>", 0),
     (1201, "eve", None, "Receipt April", NOW - 30, NOW - 30, 12, 1, 0, 0, 0, None, 0),
     (1004, "eve", None, "A note", NOW - 15, NOW - 15, 10, 1, 0, 0, 0, None, 0),
+    (1101, "me", None, "Offer", NOW - 500, NOW - 500, 10, 1, 0, 0, 0, "<o1@example.com>", 0),
+    (1301, "eve", None, "Binned", NOW - 40, NOW - 40, 15, 1, 0, 0, 0, None, 0),
 ]
-LABELS = [(1001, 11), (1003, 11), (1004, 13)]
+LABELS = [(1001, 11), (1003, 11), (1004, 13), (1101, 14)]
 NOTES = {1004}  # messages.type 2: an Apple Notes note in the "Notes" folder
-RECIPIENTS = [(201, "bob", 0, 0), (201, "carol", 1, 0), (202, "dave", 0, 0), (203, "noreply", 0, 0)]
+RECIPIENTS = [(201, "bob", 0, 0), (201, "carol", 1, 0), (202, "dave", 0, 0), (203, "noreply", 0, 0),
+              (1101, "carol", 0, 0)]
 ATTACHMENTS = [101, 101, 301]
 
 
 def build_index(path, drop_column=None):
     con = sqlite3.connect(path)
     con.executescript(SCHEMA)
-    con.executemany("INSERT INTO mailboxes (ROWID, url) VALUES (?, ?)", MAILBOXES)
+    con.executemany(
+        "INSERT INTO mailboxes (ROWID, url, source) VALUES (?, ?, ?)",
+        [(rowid, url, SOURCES.get(rowid)) for rowid, url in MAILBOXES],
+    )
     address_ids = {}
     for key, (address, comment) in ADDRESSES.items():
         address_ids[key] = con.execute(
@@ -287,7 +297,7 @@ def test_gmail_labels_put_messages_in_inbox(mail_db):
     inbox_box = envelope_index.find_inbox(index, "UUID-G")
     assert inbox_box.id == 11 and inbox_box.path == "INBOX"
     assert ids(index.messages([11])) == [1001]  # labelled; 1002 is only in All Mail, 1003 deleted
-    assert ids(index.messages([10])) == [1001, 1004, 1002]  # All Mail lists the note it stores
+    assert ids(index.messages([10])) == [1001, 1004, 1002, 1101]  # All Mail lists the note it stores
     assert ids(index.messages([13])) == []  # but Mail does not list it in "Notes"
     assert index.counts([11]) == (1, 1)
 
@@ -409,7 +419,7 @@ def test_list_mailboxes(mail_db):
     gmail = inbox.list_mailboxes(account="Gmail", include_counts=False)
     assert "  📂 INBOX\n  📂 All Mail\n  📂 Kvätton\n  📂 Notes" in gmail
     counted = inbox.list_mailboxes(account="Gmail")
-    assert "  📂 All Mail (3 total, 1 unread)\n  📂 Kvätton (1 total, 0 unread)\n  📂 Notes (0 total, 0 unread)" in counted
+    assert "  📂 All Mail (4 total, 1 unread)\n  📂 Kvätton (1 total, 0 unread)\n  📂 Notes (0 total, 0 unread)" in counted
 
 
 def test_inbox_overview(mail_db):
@@ -510,12 +520,14 @@ def test_search_emails(mail_db):
     assert item["mail_link"] == "message://%3Ce1@example.org%3E"
 
     everywhere = json.loads(search.search_emails(mailbox="All", output_format="json", limit=50))
-    # Sent Items and Deleted Items are skipped, sub-mailboxes are not searched
-    # As the script: All Mail is searched too, so an inbox message is listed
-    # twice (INBOX and All Mail); Notes shows no note.
+    # Sent Items and Deleted Items are skipped, sub-mailboxes are not searched.
+    # All Mail is searched, but 1001 is listed once, under its label mailbox
+    # INBOX; Notes shows no note.
+    # Papperskorgen (Swedish Trash) is skipped; 1101 (in Skickat) shows under All Mail.
     assert sorted((i["message_id"], i["mailbox"]) for i in everywhere["items"]) == [
-        ("1001", "All Mail"), ("1001", "INBOX"), ("1002", "All Mail"), ("1004", "All Mail"),
-        ("101", "Inbox"), ("102", "Inbox"), ("104", "Inbox"), ("105", "Inbox"), ("1201", "Kvätton"),
+        ("1001", "INBOX"), ("1002", "All Mail"), ("1004", "All Mail"),
+        ("101", "Inbox"), ("102", "Inbox"), ("104", "Inbox"), ("105", "Inbox"),
+        ("1101", "All Mail"), ("1201", "Kvätton"),
     ]
 
     flagged = json.loads(search.search_emails(account="Work", flag_color="blue", output_format="json"))
@@ -602,13 +614,61 @@ def test_quoted_sender_in_listings_and_filters(mail_db):
 def test_statistics_count_each_message_once(mail_db):
     """The script counts a Gmail message once per mailbox it is in (a bug)."""
     overview = analytics.get_statistics(account="Gmail", days_back=0)
-    assert "Total Emails: 4\n" in overview  # 1001 is in INBOX and All Mail: counted once
-    assert "INBOX: 1 (25%)\nAll Mail: 3 (75%)\nKvätton: 1 (25%)" in overview
+    # 1001 is in INBOX and All Mail: counted once. Skickat and Papperskorgen
+    # are skipped as Sent and Trash; 1101 still counts through All Mail.
+    assert "Total Emails: 5\n" in overview
+    assert "INBOX: 1 (20%)\nAll Mail: 4 (80%)\nKvätton: 1 (20%)" in overview
     sender = analytics.get_statistics(account="Gmail", scope="sender_stats", sender="eve", days_back=0)
     assert "Total emails: 4\nUnread: 1\n" in sender
 
 
 def test_awaiting_reply_reports_missing_mailboxes_without_the_script(mail_db, monkeypatch):
-    assert smart_inbox.get_awaiting_reply(account="gmail") == "Error: Could not find Sent mailbox for account gmail"
     monkeypatch.setattr(envelope_index, "find_inbox", lambda index, uuid: None)
     assert smart_inbox.get_awaiting_reply(account="work") == "Error: No inbox mailbox found for account Work"
+    monkeypatch.setattr(smart_inbox, "_sent_mailbox", lambda index, uuid: None)
+    assert smart_inbox.get_awaiting_reply(account="gmail") == "Error: Could not find Sent mailbox for account gmail"
+
+
+def test_awaiting_reply_finds_a_localised_gmail_sent_mailbox(mail_db):
+    """Gmail in Swedish: the Sent mailbox is "[Gmail]/Skickat", shown as "Skickat"."""
+    result = smart_inbox.get_awaiting_reply(account="Gmail")
+    assert result == "\n".join([
+        "EMAILS AWAITING REPLY",
+        "Account: Gmail | Last 7 days",
+        "========================================",
+        "",
+        "1. Offer",
+        "   To: Carol, Inc <carol@example.com>",  # the script joins name and address unquoted
+        f"   Sent: {date_of(-500)}",
+        "",
+        "========================================",
+        "Found 1 sent email(s) awaiting reply.",
+    ])
+
+
+def test_all_mail_is_found_by_role(mail_db, monkeypatch):
+    index = envelope_index.get_index()
+    assert index.all_mail_ids() == {10}
+    # All Mail under a name no list knows, listed before INBOX: it is still
+    # recognised by its role, so 1001 is shown under INBOX.
+    con = sqlite3.connect(mail_db)
+    con.execute("UPDATE mailboxes SET url = 'imap://UUID-G/%5BGmail%5D/Archivio' WHERE ROWID = 10")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(
+        envelope_index, "mailbox_tree",
+        lambda account=None, with_subs=True: [("Gmail", [("Archivio", []), ("INBOX", [])])],
+    )
+    everywhere = json.loads(search.search_emails(account="Gmail", mailbox="All", output_format="json", limit=50))
+    by_id = {i["message_id"]: i["mailbox"] for i in everywhere["items"]}
+    assert by_id["1001"] == "INBOX"
+
+
+def test_swedish_special_folders_in_shared_constants():
+    from apple_mail_mcp import constants
+
+    for name in ("Skickat", "Skickade meddelanden", "Papperskorgen", "Borttagna objekt", "Skräppost", "Utkast"):
+        assert name in constants.SKIP_FOLDERS
+    assert {"Skickat", "Skickade meddelanden"} <= set(constants.SENT_MAILBOX_NAMES)
+    assert constants.SENT_MAILBOX_NAMES[:3] == ["Sent Messages", "Sent", "Sent Items"]
+    assert "All e-post" in constants.ALL_MAIL_NAMES

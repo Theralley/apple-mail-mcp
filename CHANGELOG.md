@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or an account or mailbox cannot be resolved, the tool runs its AppleScript
   as before; the reason is logged to stderr once. `APPLE_MAIL_MCP_NO_INDEX=1`
   forces AppleScript. `scripts/parity_check.py` compares both paths live.
+- **Gmail and Swedish accounts.** `search_emails(mailbox="All")` lists a
+  message once, under its label mailbox (INBOX, ...) rather than again under
+  All Mail. `get_statistics` counts each message once instead of once per
+  mailbox it is in. Swedish special folders (Skickat, Skickade meddelanden,
+  Papperskorgen, Borttagna objekt, Skräppost, Utkast) are skipped like their
+  English names, and `get_awaiting_reply` / `get_needs_response` find a
+  Sent mailbox under any name in `SENT_MAILBOX_NAMES` (e.g. Gmail's
+  "Skickat"). Both the AppleScript and the Envelope Index paths do this; the
+  index recognises All Mail by its role (`mailboxes.source`), names are the
+  fallback.
 - **Message bodies are read from disk; the server never asks Mail for
   `content`.** `content of <message>` makes Mail convert HTML to text through
   legacy WebKit (NSHTMLReader) on its main thread. That cost 0.35-0.7 s per

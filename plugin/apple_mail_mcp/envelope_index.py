@@ -257,6 +257,19 @@ class EnvelopeIndex:
             found.append(Mailbox(rowid, account_uuid, _nfc(unquote(path))))
         return found
 
+    def all_mail_ids(self) -> set:
+        """Ids of Gmail "All Mail" mailboxes, by role rather than name.
+
+        A Gmail label mailbox (INBOX, Sent, ...) names the mailbox that
+        stores its messages in mailboxes.source; that is All Mail. The
+        schema has no other role (special-use) data, so other roles are
+        known by name only (constants.SENT_MAILBOX_NAMES, SKIP_FOLDERS).
+        """
+        columns = {row[1] for row in self.query("PRAGMA table_info(mailboxes)")}
+        if "source" not in columns:
+            return set()
+        return {row[0] for row in self.query("SELECT DISTINCT source FROM mailboxes WHERE source IS NOT NULL")}
+
     def find_mailbox(self, account_uuid: str, path: str) -> Optional[Mailbox]:
         """The mailbox at *path* ("INBOX", "Projects/2024") of an account.
 

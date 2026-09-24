@@ -25,6 +25,7 @@ from apple_mail_mcp.constants import (
     NEWSLETTER_KEYWORD_PATTERNS,
     THREAD_PREFIXES,
     FLAG_COLOR_NAMES,
+    SENT_MAILBOX_NAMES,
 )
 
 # AppleScript list literal of color names indexed by flag index, e.g.
@@ -61,6 +62,18 @@ def _strip_subject_prefixes_script() -> str:
         return baseSubj
     end stripPrefixes
 '''
+
+
+def _sent_mailbox_script() -> str:
+    """AppleScript setting sentMailbox to the first of SENT_MAILBOX_NAMES (or missing value)."""
+    names = ", ".join(f'"{escape_applescript(n)}"' for n in SENT_MAILBOX_NAMES)
+    return f"""set sentMailbox to missing value
+            repeat with sentName in {{{names}}}
+                try
+                    set sentMailbox to mailbox (sentName as string) of targetAccount
+                    exit repeat
+                end try
+            end repeat"""
 
 
 def _newsletter_filter_condition(sender_var: str = "lowerSender") -> str:
@@ -142,20 +155,10 @@ def get_awaiting_reply(
             set targetAccount to account "{escaped_account}"
 
             -- Get Sent mailbox
-            set sentMailbox to missing value
-            try
-                set sentMailbox to mailbox "Sent Messages" of targetAccount
-            on error
-                try
-                    set sentMailbox to mailbox "Sent" of targetAccount
-                on error
-                    try
-                        set sentMailbox to mailbox "Sent Items" of targetAccount
-                    on error
-                        return "Error: Could not find Sent mailbox for account {escaped_account}"
-                    end try
-                end try
-            end try
+            {_sent_mailbox_script()}
+            if sentMailbox is missing value then
+                return "Error: Could not find Sent mailbox for account {escaped_account}"
+            end if
 
             -- Get Inbox mailbox
             {inbox_mailbox_script("inboxMailbox", "targetAccount")}
@@ -321,18 +324,7 @@ def get_needs_response(
 
             -- Collect sent subjects for "already replied" detection
             set sentSubjects to {{}}
-            set sentMailbox to missing value
-            try
-                set sentMailbox to mailbox "Sent Messages" of targetAccount
-            on error
-                try
-                    set sentMailbox to mailbox "Sent" of targetAccount
-                on error
-                    try
-                        set sentMailbox to mailbox "Sent Items" of targetAccount
-                    end try
-                end try
-            end try
+            {_sent_mailbox_script()}
 
             if sentMailbox is not missing value then
                 -- One Apple Event for all sent subjects, then keep the newest 200
@@ -656,7 +648,6 @@ _UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕ
 _LOWER = "abcdefghijklmnopqrstuvwxyzàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþ"
 _LOWERCASE_TABLE = str.maketrans(_UPPER, _LOWER)
 
-SENT_MAILBOX_NAMES = ("Sent Messages", "Sent", "Sent Items")
 AUTOMATED_SENDER_PATTERNS = (
     "noreply", "no-reply", "donotreply", "do-not-reply",
     "notifications@", "mailer-daemon", "postmaster@",

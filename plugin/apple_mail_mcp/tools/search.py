@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp import envelope_index
-from apple_mail_mcp.constants import FLAG_COLOR_NAMES
+from apple_mail_mcp.constants import ALL_MAIL_NAMES, FLAG_COLOR_NAMES, SKIP_FOLDERS
 from apple_mail_mcp.envelope_index import IndexUnavailable, contains_ci, fold
 from apple_mail_mcp.core import (
     AS_FIELD_SEP,
@@ -313,8 +313,9 @@ def _search_mail_records(
         mailbox_script = """
                 set searchMailboxes to every mailbox of targetAccount
         """
+        skip_names = ", ".join(f'"{escape_applescript(name)}"' for name in SKIP_FOLDERS)
         skip_script = """
-                        set skipFolders to {"Trash", "Junk", "Junk Email", "Deleted Items", "Sent", "Sent Items", "Sent Messages", "Drafts", "Spam", "Deleted Messages"}
+                        set skipFolders to {""" + skip_names + """}
                         repeat with skipFolder in skipFolders
                             if mailboxName is skipFolder then
                                 set shouldSkip to true
@@ -383,24 +384,45 @@ def _search_mail_records(
     deadline: Optional[float] = None
     body_texts: Dict[str, str] = {}
 
-    if use_body_search:
-        # One budget for the whole body search: listing candidates, reading
-        # bodies (source fallbacks included) and fetching the metadata below.
-        deadline = time.monotonic() + BODY_SEARCH_BUDGET_S
-        body_texts, incomplete = _body_search_ids(
-            id_selection="id of ("
-            + matching_messages_script.replace("set matchingMessages to ", "", 1)
-            + ")",
+    chosen: Optional[Dict[str, Tuple[str, str]]] = None
+
+    if use_body_search or mailbox == "All":
+        # Mail lists candidate ids per mailbox first; the messages are chosen
+        # here and their metadata fetched by id below. For a body search the
+        # bodies are matched from disk in between; over all mailboxes each
+        # message is kept once (see _dedupe_candidates).
+        id_selection = (
+            "id of (" + matching_messages_script.replace("set matchingMessages to ", "", 1) + ")"
+        )
+        listing = dict(
+            id_selection=id_selection,
             date_setup=date_setup,
             account_setup=account_setup,
             mailbox_script=mailbox_script,
             skip_script=skip_script,
-            body_text=body_text,
-            has_attachments=has_attachments,
-            wanted=offset + limit + 1,
-            deadline=deadline,
         )
-        selected = list(body_texts)[offset:offset + limit + 1]
+        if use_body_search:
+            # One budget for the whole body search: listing candidates, reading
+            # bodies (source fallbacks included) and fetching the metadata below.
+            deadline = time.monotonic() + BODY_SEARCH_BUDGET_S
+            read_until = deadline - BODY_SEARCH_FETCH_RESERVE_S
+            candidates, incomplete = _list_candidate_ids(**listing, until=read_until)
+        else:
+            candidates, _ = _list_candidate_ids(**listing, until=None)
+        if mailbox == "All":
+            candidates = _dedupe_candidates(
+                candidates, [fold(name) in _ALL_MAIL_KEYS for _, name, _ in candidates]
+            )
+        if use_body_search:
+            if not incomplete:
+                body_texts, incomplete = _match_bodies(
+                    candidates, body_text, has_attachments, offset + limit + 1, read_until
+                )
+            ordered = list(body_texts)
+        else:
+            ordered = [i for _, _, ids in candidates for i in ids]
+        chosen = {i: (account_name, mailbox_name) for account_name, mailbox_name, ids in candidates for i in ids}
+        selected = ordered[offset:offset + limit + 1]
         if not selected:
             return [], incomplete
         message_collection = (
@@ -408,7 +430,9 @@ def _search_mail_records(
             f"currentMailbox whose {equals_any_numeric_condition('id', selected)}"
         )
         script_offset = 0
-        collect_limit = len(selected)
+        # A message listed in several mailboxes is fetched from each; the
+        # copies from mailboxes it was not chosen for are dropped below.
+        collect_limit = len(selected) * max(1, len(candidates))
 
     timeout = 180
     if deadline is not None:
@@ -564,8 +588,45 @@ def _search_mail_records(
         raise ValueError(result.split(FIELD_SEP, 1)[1])
 
     records = _parse_search_records(result)
+    if chosen is not None:
+        records = [r for r in records if _is_chosen(r, chosen)]
     _add_content_previews(records, include_content, content_length, body_texts if use_body_search else None)
     return records, incomplete
+
+
+_ALL_MAIL_KEYS = {fold(name) for name in ALL_MAIL_NAMES}
+
+
+def _clean_field(value: str) -> str:
+    """A name as it reads in a search record (the script's sanitize_field)."""
+    return re.sub(r"[\r\n\t\x1f\x1e]", " ", value).strip()
+
+
+def _is_chosen(record: Dict[str, Any], chosen: Dict[str, Tuple[str, str]]) -> bool:
+    where = chosen.get(record["message_id"])
+    return where is not None and (
+        _clean_field(where[0]) == record["account"] and _clean_field(where[1]) == record["mailbox"]
+    )
+
+
+def _dedupe_candidates(
+    candidates: List[Tuple[str, str, List[str]]], all_mail: List[bool]
+) -> List[Tuple[str, str, List[str]]]:
+    """List each message once over all mailboxes.
+
+    A Gmail message is in All Mail and in each mailbox it is labelled with
+    (INBOX, ...). It is kept under the first label mailbox that lists it, in
+    Mail's order, and under All Mail only when no other mailbox has it.
+    """
+    order = [c for c, is_all in zip(candidates, all_mail) if not is_all]
+    order += [c for c, is_all in zip(candidates, all_mail) if is_all]
+    seen: set = set()
+    kept = []
+    for account_name, mailbox_name, ids in order:
+        fresh = [i for i in ids if i not in seen]
+        seen.update(fresh)
+        kept.append((account_name, mailbox_name, fresh))
+    return kept
 
 
 def _add_content_previews(
@@ -587,29 +648,25 @@ def _add_content_previews(
             record["content_preview"] = text.strip()
 
 
-def _body_search_ids(
+def _list_candidate_ids(
     id_selection: str,
     date_setup: str,
     account_setup: str,
     mailbox_script: str,
     skip_script: str,
-    body_text: str,
-    has_attachments: Optional[bool],
-    wanted: int,
-    deadline: float,
-) -> Tuple[Dict[str, str], bool]:
-    """Return ({id: body} of messages whose body contains *body_text*, incomplete).
+    until: Optional[float],
+) -> Tuple[List[Tuple[str, str, List[str]]], bool]:
+    """([(account, mailbox, [ids newest first])], timed out) listed by Mail.
 
-    Mail only lists candidate ids (one Apple Event per mailbox, with every
-    non-body filter in the whose clause); the bodies are read from disk by
-    emlx.py, so Mail never renders message content. Stops after *wanted*
-    matches, or incomplete when the listing, the body reads or their source
-    fallbacks reach *deadline* minus BODY_SEARCH_FETCH_RESERVE_S.
+    One Apple Event per mailbox, with every filter in the whose clause. With
+    *until* (a monotonic deadline) the listing gets the time left and a
+    timeout reports (nothing, True); otherwise it may take 180 s.
     """
-    read_until = deadline - BODY_SEARCH_FETCH_RESERVE_S
-    timeout = int(read_until - time.monotonic())
-    if timeout < 1:
-        return {}, True
+    timeout = 180
+    if until is not None:
+        timeout = int(until - time.monotonic())
+        if timeout < 1:
+            return [], True
 
     script = f'''
     tell application "Mail"
@@ -650,8 +707,8 @@ def _body_search_ids(
     try:
         result = run_applescript(script, timeout=timeout)
     except Exception as exc:
-        if _timed_out(exc, read_until):
-            return {}, True
+        if until is not None and _timed_out(exc, until):
+            return [], True
         raise
     if result.startswith("ERROR" + FIELD_SEP):
         raise ValueError(result.split(FIELD_SEP, 1)[1])
@@ -664,7 +721,7 @@ def _body_search_ids(
         account_name, mailbox_name, id_text = parts
         ids = [i.strip() for i in id_text.split(",")]
         candidates.append((account_name, mailbox_name, [i for i in ids if i.isdigit()]))
-    return _match_bodies(candidates, body_text, has_attachments, wanted, read_until)
+    return candidates, False
 
 
 def _match_bodies(
@@ -944,13 +1001,6 @@ def get_email_thread(
 # search_emails from Mail's Envelope Index (see envelope_index.py)
 # ---------------------------------------------------------------------------
 
-# The mailboxes the search script skips for mailbox="All"
-SEARCH_SKIP_FOLDERS = (
-    "Trash", "Junk", "Junk Email", "Deleted Items", "Sent", "Sent Items",
-    "Sent Messages", "Drafts", "Spam", "Deleted Messages",
-)
-
-
 def _day_start(value: str) -> float:
     return datetime.strptime(value, "%Y-%m-%d").timestamp()
 
@@ -963,7 +1013,7 @@ def _search_mailboxes(index, account: Optional[str], mailbox: str):
     else:
         accounts = envelope_index.mail_accounts()
     if mailbox == "All":
-        skip = {fold(name) for name in SEARCH_SKIP_FOLDERS}
+        skip = {fold(name) for name in SKIP_FOLDERS}
         tree = dict(envelope_index.mailbox_tree(account, with_subs=False))
         found = []
         for name, uuid in accounts:
@@ -1027,39 +1077,50 @@ def _search_records_from_index(
 
     incomplete = False
     body_texts: Dict[str, str] = {}
+    lines = []
+    if body_text is None and mailbox != "All":
+        skip, collect = offset, limit + 1
+        for account_name, boxes in layout:
+            for mailbox_name, box in boxes:
+                if collect <= 0:
+                    break
+                matching = index.count([box.id], **filters)
+                if skip >= matching:
+                    skip -= matching
+                    continue
+                page = index.messages([box.id], **filters, limit=collect, offset=skip)
+                skip = 0
+                collect -= len(page)
+                lines += [_record_line(m, mailbox_name, account_name) for m in page]
+        return _parse_search_records(clean_script_output(RECORD_SEP.join(lines))), incomplete, body_texts
+
+    # As the script: candidate ids per mailbox, then (over all mailboxes)
+    # each message once, then the bodies, then the chosen page.
+    boxes_in_order = [(a, name, box) for a, boxes in layout for name, box in boxes]
+    candidates = [
+        (a, name, [str(m.id) for m in index.messages([box.id], **filters)]) for a, name, box in boxes_in_order
+    ]
+    if mailbox == "All":
+        all_mail = index.all_mail_ids()
+        candidates = _dedupe_candidates(
+            candidates,
+            [box.id in all_mail or fold(name) in _ALL_MAIL_KEYS for _, name, box in boxes_in_order],
+        )
     if body_text is not None:
         deadline = time.monotonic() + BODY_SEARCH_BUDGET_S
-        candidates = [
-            (account_name, mailbox_name, [str(m.id) for m in index.messages([box.id], **filters)])
-            for account_name, boxes in layout
-            for mailbox_name, box in boxes
-        ]
         body_texts, incomplete = _match_bodies(
             candidates, body_text, has_attachments, offset + limit + 1,
             deadline - BODY_SEARCH_FETCH_RESERVE_S,
         )
-        wanted_ids = set(list(body_texts)[offset:offset + limit + 1])
-        if not wanted_ids:
-            return [], incomplete, body_texts
-        skip, collect = 0, len(wanted_ids)
+        ordered = list(body_texts)
     else:
-        wanted_ids = None
-        skip, collect = offset, limit + 1
-
-    lines = []
-    for account_name, boxes in layout:
-        for mailbox_name, box in boxes:
-            if collect <= 0:
-                break
-            if wanted_ids is not None:
-                filters["ids"] = [int(i) for i in wanted_ids]
-            matching = index.count([box.id], **filters)
-            if skip >= matching:
-                skip -= matching
-                continue
-            page = index.messages([box.id], **filters, limit=collect, offset=skip)
-            skip = 0
-            collect -= len(page)
+        ordered = [i for _, _, ids in candidates for i in ids]
+    selected = set(ordered[offset:offset + limit + 1])
+    where = {i: (a, name) for a, name, ids in candidates for i in ids}
+    for account_name, mailbox_name, box in boxes_in_order:
+        mine = [int(i) for i in selected if where.get(i) == (account_name, mailbox_name)]
+        if mine:
+            page = index.messages([box.id], **filters, ids=mine)
             lines += [_record_line(m, mailbox_name, account_name) for m in page]
     return _parse_search_records(clean_script_output(RECORD_SEP.join(lines))), incomplete, body_texts
 
