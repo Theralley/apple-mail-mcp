@@ -237,7 +237,7 @@ cp -r plugin/skills/email-management ~/.claude/skills/email-management
 - `fastmcp` (+ optional `mcp-ui-server` for dashboard)
 - Claude Desktop or any MCP-compatible client
 - Mail.app permissions: Automation + Mail Data Access (grant in **System Settings > Privacy & Security > Automation**)
-- Recommended: **Full Disk Access** for the app that launches the server (Terminal, Claude, …). Message bodies are read from Mail's on-disk `.emlx` files under `~/Library/Mail`; without access the server asks Mail for the raw `source` instead, which is slower. It never asks Mail for rendered `content`, because that makes Mail convert HTML through WebKit on its main thread and blocks every other client.
+- Recommended: **Full Disk Access** for the app that launches the server (Terminal, Claude, …). Message bodies are read from Mail's on-disk `.emlx` files under `~/Library/Mail`; without access the server asks Mail for the raw `source` instead, which is slower. It never asks Mail for rendered `content`, because that makes Mail convert HTML through WebKit on its main thread and blocks every other client. Listings, counts and searches read Mail's `Envelope Index` database read-only for the same reason (asking Mail for every message of a large mailbox runs a full query on its main thread); without access they use AppleScript as before. Set `APPLE_MAIL_MCP_NO_INDEX=1` to always use AppleScript.
 
 ## Troubleshooting
 

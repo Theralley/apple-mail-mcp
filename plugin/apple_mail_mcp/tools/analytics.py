@@ -4,11 +4,14 @@ import os
 from typing import Optional, List, Dict, Any
 
 from apple_mail_mcp.server import mcp
+from apple_mail_mcp import envelope_index
+from apple_mail_mcp.envelope_index import IndexUnavailable, fold
 from apple_mail_mcp.core import (
     AS_FIELD_SEP,
     AS_RECORD_SEP,
     FIELD_SEP,
     RECORD_SEP,
+    clean_script_output,
     inject_preferences,
     escape_applescript,
     run_applescript,
@@ -133,6 +136,10 @@ def get_statistics(
     Returns:
         Formatted statistics report with metrics and insights
     """
+    try:
+        return _statistics_from_index(account, scope, sender, mailbox, days_back)
+    except IndexUnavailable:
+        pass
 
     # Escape user inputs for AppleScript
     escaped_account = escape_applescript(account)
@@ -668,6 +675,10 @@ def _get_recent_emails_structured(
     - account: str
     - preview: str
     """
+    try:
+        return _recent_emails_from_index(max_total, max_per_account)
+    except IndexUnavailable:
+        pass
     script = f'''
     tell application "Mail"
         set allEmails to {{}}
@@ -778,3 +789,129 @@ def inbox_dashboard() -> Any:
         accounts_data=accounts_data,
         recent_emails=recent_emails
     )
+
+
+# ---------------------------------------------------------------------------
+# The same reports from Mail's Envelope Index (see envelope_index.py).
+# ---------------------------------------------------------------------------
+
+RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+
+def _counted_mailboxes(index, account: str):
+    """Top-level mailboxes of *account* the scripts analyse (system folders skipped)."""
+    uuid = envelope_index.account_uuid(account)
+    skip = {fold(name) for name in SKIP_FOLDERS}
+    for _, mailboxes in envelope_index.mailbox_tree(account, with_subs=False):
+        for mailbox_name, _ in mailboxes:
+            if fold(mailbox_name) in skip:
+                continue
+            mailbox = index.find_mailbox(uuid, mailbox_name)
+            if mailbox is not None:
+                yield mailbox_name, mailbox
+
+
+def _percent(part: int, whole: int) -> int:
+    """AppleScript ``round ((part / whole) * 100)`` (halves to even)."""
+    return round((part / whole) * 100)
+
+
+def _statistics_from_index(account, scope, sender, mailbox, days_back) -> str:
+    if scope not in ("account_overview", "sender_stats", "mailbox_breakdown"):
+        raise IndexUnavailable("the script reports the invalid scope")
+    if scope == "sender_stats" and not sender:
+        raise IndexUnavailable("the script reports the missing sender")
+    index = envelope_index.get_index()
+    cutoff = envelope_index.days_back_cutoff(days_back)
+
+    if scope == "account_overview":
+        total = unread = flagged = with_attachments = 0
+        senders: list = []  # [sender, count], first seen first, as the script keeps them
+        sender_slot: dict = {}
+        mailbox_counts = []
+        for mailbox_name, box in _counted_mailboxes(index, account):
+            messages = index.messages([box.id], received_after=cutoff)
+            attached = index.with_attachments(m.id for m in messages)
+            for message in messages:
+                total += 1
+                if not message.read:
+                    unread += 1
+                if message.flagged:
+                    flagged += 1
+                if message.id in attached:
+                    with_attachments += 1
+                key = fold(message.sender)
+                if key in sender_slot:
+                    senders[sender_slot[key]][1] += 1
+                else:
+                    sender_slot[key] = len(senders)
+                    senders.append([message.sender, 1])
+            if messages:
+                mailbox_counts.append((mailbox_name, len(messages)))
+        read = total - unread
+
+        out = "╔══════════════════════════════════════════╗\n"
+        out += f"║      EMAIL STATISTICS - {account}       ║\n"
+        out += "╚══════════════════════════════════════════╝\n\n"
+        out += f"📊 VOLUME METRICS\n{RULE}\n"
+        out += f"Total Emails: {total}\n"
+        if total > 0:
+            out += f"Unread: {unread} ({_percent(unread, total)}%)\n"
+            out += f"Read: {read} ({_percent(read, total)}%)\n"
+            out += f"Flagged: {flagged}\n"
+            out += f"With Attachments: {with_attachments} ({_percent(with_attachments, total)}%)\n"
+        else:
+            out += "Unread: 0\nRead: 0\nFlagged: 0\nWith Attachments: 0\n"
+        out += "\n"
+        out += f"👥 TOP SENDERS\n{RULE}\n"
+        for name, count in senders[:5]:
+            out += f"{name}: {count} emails\n"
+        out += "\n"
+        out += f"📁 MAILBOX DISTRIBUTION\n{RULE}\n"
+        for name, count in mailbox_counts[:5]:
+            if total > 0:
+                out += f"{name}: {count} ({_percent(count, total)}%)\n"
+            else:
+                out += f"{name}: {count}\n"
+        return clean_script_output(out)
+
+    if scope == "sender_stats":
+        total = unread = with_attachments = 0
+        for _, box in _counted_mailboxes(index, account):
+            messages = index.messages([box.id], sender_contains=sender, received_after=cutoff)
+            attached = index.with_attachments(m.id for m in messages)
+            total += len(messages)
+            unread += sum(1 for m in messages if not m.read)
+            with_attachments += sum(1 for m in messages if m.id in attached)
+        out = f"SENDER STATISTICS\n\nSender: {sender}\nAccount: {account}\n\n"
+        out += f"Total emails: {total}\nUnread: {unread}\nWith attachments: {with_attachments}\n"
+        return clean_script_output(out)
+
+    mailbox_param = mailbox if mailbox else "INBOX"
+    box = envelope_index.resolve_mailbox(index, envelope_index.account_uuid(account), mailbox_param)
+    total, unread = index.counts([box.id])
+    out = f"MAILBOX STATISTICS\n\nMailbox: {mailbox_param}\nAccount: {account}\n\n"
+    out += f"Total messages: {total}\nUnread: {unread}\nRead: {total - unread}\n"
+    return clean_script_output(out)
+
+
+def _recent_emails_from_index(max_total: int, max_per_account: int) -> List[Dict[str, Any]]:
+    index = envelope_index.get_index()
+    rows = []
+    for name, uuid in envelope_index.mail_accounts():
+        inbox = envelope_index.find_inbox(index, uuid)
+        if inbox is not None and max_per_account > 0:
+            rows += [(name, m) for m in index.messages([inbox.id], limit=max_per_account)]
+    rows = rows[:max_total]
+    dates = envelope_index.date_strings(m.date_received for _, m in rows)
+    return [
+        {
+            "subject": clean_script_output(message.subject),
+            "sender": clean_script_output(message.sender),
+            "date": dates[message.date_received],
+            "is_read": message.read,
+            "account": clean_script_output(name),
+            "preview": _dashboard_preview(str(message.id), name),
+        }
+        for name, message in rows
+    ]

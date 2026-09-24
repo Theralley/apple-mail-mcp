@@ -5,14 +5,19 @@ from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
+from apple_mail_mcp import envelope_index
 from apple_mail_mcp.emlx import fill_body_tokens, new_body_nonce
+from apple_mail_mcp.envelope_index import IndexUnavailable, fold
 from apple_mail_mcp.core import (
+    clean_script_output,
     inject_preferences,
     escape_applescript,
     run_applescript,
     inbox_mailbox_script,
     content_preview_script,
 )
+
+RULE = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 
 def _parse_pipe_delimited_emails(raw: str) -> List[Dict[str, Any]]:
@@ -123,6 +128,11 @@ def list_inbox_emails(
     if output_format == "json":
         return _list_inbox_emails_json(account, max_emails, include_read, include_content)
 
+    try:
+        return _list_inbox_emails_from_index(account, max_emails, include_read, include_content)
+    except IndexUnavailable:
+        pass
+
     escaped_account = escape_applescript(account) if account else None
     account_filter = f'if accountName is "{escaped_account}" then' if account else ""
     account_filter_end = "end if" if account else ""
@@ -218,6 +228,11 @@ def _list_inbox_emails_json(
     include_content: bool = False,
 ) -> str:
     """Return inbox emails as a JSON string."""
+    try:
+        return json.dumps(_inbox_records_from_index(account, max_emails, include_read), indent=2)
+    except IndexUnavailable:
+        pass
+
     escaped_account = escape_applescript(account) if account else None
     account_filter = f'if accountName is "{escaped_account}" then' if account else ""
     account_filter_end = "end if" if account else ""
@@ -495,6 +510,10 @@ def list_mailboxes(account: Optional[str] = None, include_counts: bool = True) -
         Formatted list of mailboxes with optional message counts.
         For nested mailboxes, shows both indented format and path format (e.g., "Projects/Amplify Impact")
     """
+    try:
+        return _list_mailboxes_from_index(account, include_counts)
+    except IndexUnavailable:
+        pass
 
     count_script = (
         """
@@ -591,6 +610,10 @@ def get_inbox_overview() -> str:
     This tool is designed to give you a complete picture of your inbox and prompt the assistant
     to suggest relevant actions based on the current state.
     """
+    try:
+        return _inbox_overview_from_index()
+    except IndexUnavailable:
+        pass
 
     script = f"""
     tell application "Mail"
@@ -761,3 +784,198 @@ def get_inbox_overview() -> str:
 
     result = run_applescript(script)
     return result
+
+
+# ---------------------------------------------------------------------------
+# The same reports from Mail's Envelope Index (see envelope_index.py). Each
+# builds the text its script built, line for line, and raises
+# IndexUnavailable when the script has to run instead.
+# ---------------------------------------------------------------------------
+
+
+def _selected_accounts(account: Optional[str]) -> List[Tuple[str, str]]:
+    """(name, uuid) of every account, or of the one called *account*."""
+    accounts = envelope_index.mail_accounts()
+    if account:
+        accounts = [a for a in accounts if fold(a[0]) == fold(account)]
+    return accounts
+
+
+def _inbox_pages(account: Optional[str], max_emails: int, include_read: bool):
+    """[(name, inbox or None, messages in inbox, page of messages)] per account."""
+    index = envelope_index.get_index()
+    pages = []
+    for name, uuid in _selected_accounts(account):
+        inbox = envelope_index.find_inbox(index, uuid)
+        if inbox is None:
+            pages.append((name, None, 0, []))
+            continue
+        page = index.messages(
+            [inbox.id],
+            unread_only=not include_read,
+            limit=max_emails if max_emails > 0 else None,
+        )
+        pages.append((name, inbox, index.count([inbox.id]), page))
+    return pages
+
+
+def _list_inbox_emails_from_index(
+    account: Optional[str], max_emails: int, include_read: bool, include_content: bool
+) -> str:
+    pages = _inbox_pages(account, max_emails, include_read)
+    dates = envelope_index.date_strings(m.date_received for _, _, _, page in pages for m in page)
+    nonce = new_body_nonce()
+    out = "INBOX EMAILS - ALL ACCOUNTS\n\n"
+    total = 0
+    for name, inbox, message_count, page in pages:
+        if inbox is None:
+            out += f"⚠ Error accessing inbox for account {name}\n"
+            out += f"   No inbox mailbox found for account {name}\n\n"
+            continue
+        if not page:
+            continue
+        out += f"{RULE}\n📧 ACCOUNT: {name} ({message_count} messages)\n{RULE}\n\n"
+        for message in page:
+            indicator = "✓" if message.read else "✉"
+            out += f"{indicator} {message.subject}\n"
+            out += f"   From: {message.sender}\n"
+            out += f"   Date: {dates[message.date_received]}\n"
+            if message.internet_message_id:
+                out += f"   Link: message://%3C{message.internet_message_id}%3E\n"
+            if include_content:
+                out += f"   Content: ⟦body:{nonce}:{message.id}|{name}|INBOX⟧\n"
+            out += "\n"
+            total += 1
+    out += "========================================\n"
+    out += f"TOTAL EMAILS: {total}\n"
+    out += "========================================\n"
+    result = clean_script_output(out)
+    if include_content:
+        result = fill_body_tokens(result, 200, nonce, missing="[Not available]")
+    return result
+
+
+def _inbox_records_from_index(
+    account: Optional[str], max_emails: int, include_read: bool
+) -> List[Dict[str, Any]]:
+    pages = _inbox_pages(account, max_emails, include_read)
+    dates = envelope_index.date_strings(m.date_received for _, _, _, page in pages for m in page)
+    emails = []
+    for name, inbox, _, page in pages:
+        for message in page:
+            email: Dict[str, Any] = {
+                "subject": clean_script_output(message.subject),
+                "sender": clean_script_output(message.sender),
+                "date": dates[message.date_received],
+                "is_read": message.read,
+                "account": clean_script_output(name),
+                "message_id": str(message.id),
+            }
+            if message.internet_message_id:
+                email["internet_message_id"] = message.internet_message_id
+                email["mail_link"] = f"message://%3C{quote(message.internet_message_id, safe='@')}%3E"
+            emails.append(email)
+    return emails
+
+
+def _list_mailboxes_from_index(account: Optional[str], include_counts: bool) -> str:
+    index = envelope_index.get_index()
+    tree = envelope_index.mailbox_tree(account)
+
+    def counts(uuid: str, path: str) -> str:
+        if not include_counts:
+            return ""
+        mailbox = index.find_mailbox(uuid, path)
+        total, unread = index.counts([mailbox.id]) if mailbox is not None else (0, 0)
+        return f" ({total} total, {unread} unread)"
+
+    out = "MAILBOXES\n\n"
+    for account_name, mailboxes in tree:
+        if account and fold(account_name) != fold(account):
+            continue
+        uuid = envelope_index.account_uuid(account_name)
+        out += f"{RULE}\n📁 ACCOUNT: {account_name}\n{RULE}\n\n"
+        for mailbox_name, sub_names in mailboxes:
+            out += f"  📂 {mailbox_name}{counts(uuid, mailbox_name)}\n"
+            for sub_name in sub_names:
+                path = f"{mailbox_name}/{sub_name}"
+                out += f"    └─ {sub_name} [Path: {path}]{counts(uuid, path)}\n"
+        out += "\n"
+    return clean_script_output(out)
+
+
+def _inbox_overview_from_index() -> str:
+    index = envelope_index.get_index()
+    accounts = envelope_index.mail_accounts()
+    out = "╔══════════════════════════════════════════╗\n"
+    out += "║      EMAIL INBOX OVERVIEW                ║\n"
+    out += "╚══════════════════════════════════════════╝\n\n"
+
+    out += f"📊 UNREAD EMAILS BY ACCOUNT\n{RULE}\n"
+    total_unread = 0
+    recent = []
+    for name, uuid in accounts:
+        inbox = envelope_index.find_inbox(index, uuid)
+        if inbox is None:
+            out += f"  ❌ {name}: Error accessing inbox\n"
+            continue
+        total, unread = index.counts([inbox.id])
+        total_unread += unread
+        mark = "  ⚠️  " if unread > 0 else "  ✅ "
+        out += f"{mark}{name}: {unread} unread ({total} total)\n"
+        recent += [(name, m) for m in index.messages([inbox.id], limit=10)]
+    out += "\n"
+    out += f"📈 TOTAL UNREAD: {total_unread} across all accounts\n"
+    out += "\n\n"
+
+    out += f"📁 MAILBOX STRUCTURE\n{RULE}\n"
+    for account_name, mailboxes in envelope_index.mailbox_tree():
+        out += f"\nAccount: {account_name}\n"
+        uuid = envelope_index.account_uuid(account_name)
+
+        def unread_of(path: str) -> int:
+            mailbox = index.find_mailbox(uuid, path)
+            return index.counts([mailbox.id])[1] if mailbox is not None else 0
+
+        for mailbox_name, sub_names in mailboxes:
+            unread = unread_of(mailbox_name)
+            if unread > 0:
+                out += f"  📂 {mailbox_name} ({unread} unread)\n"
+            else:
+                out += f"  📂 {mailbox_name}\n"
+            for sub_name in sub_names:
+                sub_unread = unread_of(f"{mailbox_name}/{sub_name}")
+                if sub_unread > 0:
+                    out += f"     └─ {sub_name} ({sub_unread} unread)\n"
+    out += "\n\n"
+
+    out += f"📬 RECENT EMAILS PREVIEW (10 Most Recent)\n{RULE}\n"
+    shown = recent[:10]
+    dates = envelope_index.date_strings(m.date_received for _, m in shown)
+    for name, message in shown:
+        indicator = "✓" if message.read else "✉"
+        out += f"\n{indicator} {message.subject}\n"
+        out += f"   Account: {name}\n"
+        out += f"   From: {message.sender}\n"
+        out += f"   Date: {dates[message.date_received]}\n"
+    if not shown:
+        out += "\nNo recent emails found.\n"
+    out += "\n\n"
+
+    out += f"💡 SUGGESTED ACTIONS FOR ASSISTANT\n{RULE}\n"
+    out += "Based on this overview, consider suggesting:\n\n"
+    if total_unread > 0:
+        out += "1. 📧 Review unread emails - Use get_recent_emails() to show recent unread messages\n"
+        out += "2. 🔍 Search for action items - Look for keywords like 'urgent', 'action required', 'deadline'\n"
+        out += "3. 📤 Move processed emails - Suggest moving read emails to appropriate folders\n"
+    else:
+        out += "1. ✅ Inbox is clear! No unread emails.\n"
+    out += "4. 📋 Organize by topic - Suggest moving emails to project-specific folders\n"
+    out += "5. ✉️  Draft replies - Identify emails that need responses\n"
+    out += "6. 🗂️  Archive old emails - Move older read emails to archive folders\n"
+    out += "7. 🔔 Highlight priority items - Identify emails from important senders or with urgent keywords\n"
+    out += "\n"
+    out += "═══════════════════════════════════════════════════\n"
+    out += "💬 Ask me to drill down into any account or take specific actions!\n"
+    out += "═══════════════════════════════════════════════════\n"
+    return clean_script_output(out)

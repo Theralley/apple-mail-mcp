@@ -3,11 +3,14 @@
 from typing import Optional
 
 from apple_mail_mcp.server import mcp
+from apple_mail_mcp import envelope_index
+from apple_mail_mcp.envelope_index import IndexUnavailable, contains_ci, fold
 from apple_mail_mcp.core import (
     AS_FIELD_SEP,
     AS_RECORD_SEP,
     FIELD_SEP,
     RECORD_SEP,
+    clean_script_output,
     inject_preferences,
     escape_applescript,
     read_flag_index_script,
@@ -96,6 +99,10 @@ def get_awaiting_reply(
     Returns:
         List of sent emails still awaiting a reply with subject, recipient, and date sent
     """
+    try:
+        return _awaiting_reply_from_index(account, days_back, exclude_noreply, max_results)
+    except IndexUnavailable:
+        pass
     escaped_account = escape_applescript(account)
 
     noreply_filter = ""
@@ -270,6 +277,10 @@ def get_needs_response(
     Returns:
         Ranked list of emails likely needing a response, with priority hints
     """
+    try:
+        return _needs_response_from_index(account, mailbox, days_back, max_results)
+    except IndexUnavailable:
+        pass
     escaped_account = escape_applescript(account)
     escaped_mailbox = escape_applescript(mailbox)
 
@@ -477,6 +488,10 @@ def get_top_senders(
     Returns:
         Ranked list of senders (or domains) with email counts
     """
+    try:
+        return _top_senders_from_index(account, mailbox, days_back, top_n, group_by_domain)
+    except IndexUnavailable:
+        pass
     escaped_account = escape_applescript(account)
     escaped_mailbox = escape_applescript(mailbox)
 
@@ -630,3 +645,204 @@ def get_top_senders(
     '''
 
     return run_applescript(script)
+
+
+# ---------------------------------------------------------------------------
+# The same reports from Mail's Envelope Index (see envelope_index.py). The
+# helpers below mirror the scripts' handlers so matching is unchanged.
+# ---------------------------------------------------------------------------
+
+_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞ"
+_LOWER = "abcdefghijklmnopqrstuvwxyzàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþ"
+_LOWERCASE_TABLE = str.maketrans(_UPPER, _LOWER)
+
+SENT_MAILBOX_NAMES = ("Sent Messages", "Sent", "Sent Items")
+AUTOMATED_SENDER_PATTERNS = (
+    "noreply", "no-reply", "donotreply", "do-not-reply",
+    "notifications@", "mailer-daemon", "postmaster@",
+)
+NOREPLY_RECIPIENT_PATTERNS = ("noreply", "no-reply", "do-not-reply", "donotreply")
+RULE = "========================================"
+
+
+def _lowercase(text: str) -> str:
+    """LOWERCASE_HANDLER: only ASCII and Latin-1 capitals are lowered."""
+    return text.translate(_LOWERCASE_TABLE)
+
+
+def _strip_prefixes(subject: str) -> str:
+    """The stripPrefixes handler; ValueError where the script errors out.
+
+    AppleScript's ``text n thru -1`` fails when nothing is left, which the
+    scripts' ``try`` turns into skipping that message.
+    """
+    base = subject
+    did_strip = True
+    while did_strip:
+        did_strip = False
+        for prefix in THREAD_PREFIXES:
+            if fold(base).startswith(fold(prefix)):
+                if len(base) <= len(prefix):
+                    raise ValueError("nothing after the prefix")
+                base = base[len(prefix):]
+                while base.startswith(" "):
+                    if len(base) == 1:
+                        raise ValueError("only a space left")
+                    base = base[1:]
+                did_strip = True
+    return base
+
+
+def _either_contains(a: str, b: str) -> bool:
+    return contains_ci(a, b) or contains_ci(b, a)
+
+
+def _sent_mailbox(index, uuid: str):
+    for name in SENT_MAILBOX_NAMES:
+        mailbox = index.find_mailbox(uuid, name)
+        if mailbox is not None:
+            return mailbox
+    return None
+
+
+def _awaiting_reply_from_index(account, days_back, exclude_noreply, max_results) -> str:
+    index = envelope_index.get_index()
+    uuid = envelope_index.account_uuid(account)
+    sent_box = _sent_mailbox(index, uuid)
+    inbox = envelope_index.find_inbox(index, uuid)
+    if sent_box is None or inbox is None:
+        raise IndexUnavailable("the script reports the missing mailbox")
+    cutoff = envelope_index.days_back_cutoff(days_back)
+
+    inbox_keys = []
+    for message in index.messages([inbox.id], received_after=cutoff):
+        try:
+            inbox_keys.append((_lowercase(_strip_prefixes(message.subject)), _lowercase(message.sender)))
+        except ValueError:
+            continue
+
+    sent_messages = index.messages([sent_box.id], sent_after=cutoff)
+    recipients = index.to_recipients(m.id for m in sent_messages)
+    found = []
+    for message in sent_messages:
+        if len(found) >= max_results:
+            break
+        if cutoff is not None and message.date_sent < cutoff:
+            break
+        to = recipients.get(message.id) or []
+        if not to:
+            continue
+        address, name = to[0]
+        if exclude_noreply and any(contains_ci(_lowercase(address), p) for p in NOREPLY_RECIPIENT_PATTERNS):
+            continue
+        try:
+            lower_base = _lowercase(_strip_prefixes(message.subject))
+        except ValueError:
+            continue
+        lower_address = _lowercase(address)
+        replied = any(
+            _either_contains(subject, lower_base) and contains_ci(sender, lower_address)
+            for subject, sender in inbox_keys
+        )
+        if not replied:
+            found.append((message, f"{name} <{address}>" if name else address))
+
+    dates = envelope_index.date_strings(m.date_sent for m, _ in found)
+    out = f"EMAILS AWAITING REPLY\nAccount: {account} | Last {days_back} days\n{RULE}\n\n"
+    for number, (message, recipient) in enumerate(found, start=1):
+        out += f"{number}. {message.subject}\n   To: {recipient}\n   Sent: {dates[message.date_sent]}\n\n"
+    out += f"{RULE}\nFound {len(found)} sent email(s) awaiting reply.\n"
+    return clean_script_output(out)
+
+
+def _needs_response_from_index(account, mailbox, days_back, max_results) -> str:
+    index = envelope_index.get_index()
+    uuid = envelope_index.account_uuid(account)
+    target = envelope_index.resolve_mailbox(index, uuid, mailbox)
+    cutoff = envelope_index.days_back_cutoff(days_back)
+
+    sent_subjects = []
+    sent_box = _sent_mailbox(index, uuid)
+    if sent_box is not None:
+        for message in index.messages([sent_box.id], limit=200):
+            try:
+                sent_subjects.append(_lowercase(_strip_prefixes(message.subject)))
+            except ValueError:
+                continue
+
+    newsletter_patterns = NEWSLETTER_PLATFORM_PATTERNS + NEWSLETTER_KEYWORD_PATTERNS
+    candidates = []
+    for message in index.messages([target.id], unread_only=True, received_after=cutoff):
+        if len(candidates) >= max_results:
+            break
+        lower_sender = _lowercase(message.sender)
+        if any(contains_ci(lower_sender, p) for p in newsletter_patterns):
+            continue
+        if any(contains_ci(lower_sender, p) for p in AUTOMATED_SENDER_PATTERNS):
+            continue
+        try:
+            lower_base = _lowercase(_strip_prefixes(message.subject))
+        except ValueError:
+            continue
+        if any(_either_contains(sent, lower_base) for sent in sent_subjects):
+            continue
+        flag_label = ""
+        if message.flag_index != -1:
+            flag_label = "flagged"
+            if 0 <= message.flag_index < 7:
+                flag_label = f"flagged {FLAG_COLOR_NAMES[message.flag_index]}"
+        candidates.append((message, flag_label))
+
+    dates = envelope_index.date_strings(m.date_received for m, _ in candidates)
+    entries = [
+        FIELD_SEP.join(["ENTRY", str(m.id), m.subject, m.sender, dates[m.date_received], label])
+        for m, label in candidates
+    ]
+    header = f"EMAILS NEEDING RESPONSE\nAccount: {account} | Mailbox: {mailbox} | Last {days_back} days\n{RULE}\n\n"
+    result = clean_script_output(header + RECORD_SEP + RECORD_SEP.join(entries))
+    return _format_needs_response(result, account, mailbox)
+
+
+def _sender_domain(sender: str) -> str:
+    at = sender.rfind("@")
+    if at == -1:
+        return sender
+    end = sender.find(">", at)
+    return sender[at + 1:end if end != -1 else len(sender)]
+
+
+def _top_senders_from_index(account, mailbox, days_back, top_n, group_by_domain) -> str:
+    index = envelope_index.get_index()
+    target = envelope_index.resolve_mailbox(index, envelope_index.account_uuid(account), mailbox)
+    messages = index.messages([target.id], received_after=envelope_index.days_back_cutoff(days_back))
+
+    keys: list = []
+    counts: list = []
+    slot: dict = {}
+    for message in messages:
+        key = _sender_domain(message.sender) if group_by_domain else message.sender
+        if fold(key) in slot:
+            counts[slot[fold(key)]] += 1
+        else:
+            slot[fold(key)] = len(keys)
+            keys.append(key)
+            counts.append(1)
+    total = len(messages)
+
+    # The script's selection sort, so ties come out in the same order
+    for i in range(min(len(counts), max(top_n, 0))):
+        max_index = i
+        for j in range(i + 1, len(counts)):
+            if counts[j] > counts[max_index]:
+                max_index = j
+        if max_index != i:
+            counts[i], counts[max_index] = counts[max_index], counts[i]
+            keys[i], keys[max_index] = keys[max_index], keys[i]
+
+    title = "TOP SENDER DOMAINS" if group_by_domain else "TOP SENDERS"
+    out = f"{title}\nAccount: {account} | Mailbox: {mailbox} | Last {days_back} days\n{RULE}\n\n"
+    for i in range(min(top_n, len(keys))):
+        pct = f" ({round((counts[i] / total) * 100)}%)" if total > 0 else ""
+        out += f"{i + 1}. {keys[i]}: {counts[i]} emails{pct}\n"
+    out += f"\n{RULE}\nTotal emails analysed: {total}\nUnique senders: {len(keys)}\n"
+    return clean_script_output(out)

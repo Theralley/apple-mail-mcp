@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Listings, counts and searches read Mail's Envelope Index instead of
+  asking Mail for messages.** `every message of <mailbox>`, `count of
+  messages`, bulk property reads and whose-queries make Mail run a full
+  database query on its main thread (`-[MFMailbox(ScriptingSupport)
+  messages]` in a spindump of a hang); `list_inbox_emails` with its defaults
+  hit the 120 s timeout. The new `envelope_index.py` opens
+  `~/Library/Mail/V<n>/MailData/Envelope Index` read-only (SQLite
+  `mode=ro`, `query_only`, retrying while Mail holds a lock) and answers
+  `list_inbox_emails`, `list_mailboxes` counts, `get_inbox_overview`,
+  `get_statistics`, `get_awaiting_reply`, `get_needs_response`,
+  `get_top_senders`, `search_emails` (filters, and the candidate ids of a
+  `body_text` search), `get_email_thread` and the dashboard's recent emails.
+  Gmail messages kept in "All Mail" count in INBOX and other mailboxes
+  through their labels; deleted messages are left out. Output is unchanged:
+  account names and mailbox order still come from Mail (names only, never
+  messages) and dates are formatted by osascript as before. If the database
+  is missing, unreadable (no Full Disk Access) or has an unexpected schema,
+  or an account or mailbox cannot be resolved, the tool runs its AppleScript
+  as before; the reason is logged to stderr once. `APPLE_MAIL_MCP_NO_INDEX=1`
+  forces AppleScript. `scripts/parity_check.py` compares both paths live.
 - **Message bodies are read from disk; the server never asks Mail for
   `content`.** `content of <message>` makes Mail convert HTML to text through
   legacy WebKit (NSHTMLReader) on its main thread. That cost 0.35-0.7 s per

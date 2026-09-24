@@ -246,8 +246,17 @@ def _run_applescript_unlocked(script: str, timeout: int) -> str:
         if stderr_text:
             raise Exception(f"AppleScript error: {stderr_text}")
 
+    return clean_script_output(stdout.decode("utf-8", errors="replace"))
+
+
+def clean_script_output(text: str) -> str:
+    """Normalise text the way run_applescript returns script output.
+
+    Tools that build their report in Python (from the Envelope Index) pass it
+    through this so the result is identical to what the script produced.
+    """
     # str.strip() would also eat a trailing separator (an empty last field)
-    output = re.sub(r"^[^\S\x1c-\x1f]+|[^\S\x1c-\x1f]+$", "", stdout.decode("utf-8", errors="replace"))
+    output = re.sub(r"^[^\S\x1c-\x1f]+|[^\S\x1c-\x1f]+$", "", text)
     return _sanitize_for_json(output)
 
 

@@ -8,12 +8,15 @@ from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
+from apple_mail_mcp import envelope_index
 from apple_mail_mcp.constants import FLAG_COLOR_NAMES
+from apple_mail_mcp.envelope_index import IndexUnavailable, contains_ci, fold
 from apple_mail_mcp.core import (
     AS_FIELD_SEP,
     AS_RECORD_SEP,
     FIELD_SEP,
     RECORD_SEP,
+    clean_script_output,
     contains_any_condition,
     inject_preferences,
     escape_applescript,
@@ -349,6 +352,28 @@ def _search_mail_records(
                 set searchAccounts to every account
         """
 
+    try:
+        records, incomplete, body_texts = _search_records_from_index(
+            account=account,
+            mailbox=mailbox,
+            subject_terms=subject_terms,
+            sender=sender,
+            has_attachments=has_attachments,
+            flagged=flagged,
+            flag_index=flag_index,
+            read_status=read_status,
+            date_from=date_from,
+            date_to=date_to,
+            offset=offset,
+            limit=limit,
+            body_text=body_text,
+        )
+    except IndexUnavailable:
+        pass
+    else:
+        _add_content_previews(records, include_content, content_length, body_texts if use_body_search else None)
+        return records, incomplete
+
     # Choose the message collection strategy. For a body search the script
     # below is run once the matching ids are known (see _body_search_ids).
     message_collection = f"                            {matching_messages_script}"
@@ -539,16 +564,27 @@ def _search_mail_records(
         raise ValueError(result.split(FIELD_SEP, 1)[1])
 
     records = _parse_search_records(result)
-    if include_content:
-        for record in records:
-            if use_body_search:
-                body = body_texts.get(record["message_id"])  # already read above
-            else:
-                body = get_message_body(record["message_id"], record["account"], record["mailbox"])
-            text = preview(body, content_length, strip_tabs=True)
-            if text:
-                record["content_preview"] = text.strip()
+    _add_content_previews(records, include_content, content_length, body_texts if use_body_search else None)
     return records, incomplete
+
+
+def _add_content_previews(
+    records: List[Dict[str, Any]],
+    include_content: bool,
+    content_length: int,
+    body_texts: Optional[Dict[str, str]],
+) -> None:
+    """Set content_preview from disk; a body search passes the bodies it read."""
+    if not include_content:
+        return
+    for record in records:
+        if body_texts is not None:
+            body = body_texts.get(record["message_id"])  # already read
+        else:
+            body = get_message_body(record["message_id"], record["account"], record["mailbox"])
+        text = preview(body, content_length, strip_tabs=True)
+        if text:
+            record["content_preview"] = text.strip()
 
 
 def _body_search_ids(
@@ -620,16 +656,29 @@ def _body_search_ids(
     if result.startswith("ERROR" + FIELD_SEP):
         raise ValueError(result.split(FIELD_SEP, 1)[1])
 
-    needle = body_text.lower()
-    matches: Dict[str, str] = {}
+    candidates = []
     for line in result.split(RECORD_SEP):
         parts = line.split(FIELD_SEP)
         if len(parts) != 3:
             continue
         account_name, mailbox_name, id_text = parts
-        for message_id in (i.strip() for i in id_text.split(",")):
-            if not message_id.isdigit():
-                continue
+        ids = [i.strip() for i in id_text.split(",")]
+        candidates.append((account_name, mailbox_name, [i for i in ids if i.isdigit()]))
+    return _match_bodies(candidates, body_text, has_attachments, wanted, read_until)
+
+
+def _match_bodies(
+    candidates: List[Tuple[str, str, List[str]]],
+    body_text: str,
+    has_attachments: Optional[bool],
+    wanted: int,
+    read_until: float,
+) -> Tuple[Dict[str, str], bool]:
+    """Read candidate bodies from disk in order; ({id: body} of matches, incomplete)."""
+    needle = body_text.lower()
+    matches: Dict[str, str] = {}
+    for account_name, mailbox_name, ids in candidates:
+        for message_id in ids:
             if len(matches) >= wanted:
                 return matches, False
             remaining = int(read_until - time.monotonic())
@@ -775,6 +824,11 @@ def get_email_thread(
     escaped_keyword = escape_applescript(cleaned_keyword)
     nonce = new_body_nonce()
 
+    try:
+        return _email_thread_from_index(account, mailbox, cleaned_keyword, max_messages, nonce)
+    except IndexUnavailable:
+        pass
+
     mailbox_script = f'''
         try
             set searchMailbox to mailbox "{escaped_mailbox}" of targetAccount
@@ -884,3 +938,170 @@ def get_email_thread(
 
     result = run_applescript(script)
     return fill_body_tokens(result, 150, nonce, missing=None)
+
+
+# ---------------------------------------------------------------------------
+# search_emails from Mail's Envelope Index (see envelope_index.py)
+# ---------------------------------------------------------------------------
+
+# The mailboxes the search script skips for mailbox="All"
+SEARCH_SKIP_FOLDERS = (
+    "Trash", "Junk", "Junk Email", "Deleted Items", "Sent", "Sent Items",
+    "Sent Messages", "Drafts", "Spam", "Deleted Messages",
+)
+
+
+def _day_start(value: str) -> float:
+    return datetime.strptime(value, "%Y-%m-%d").timestamp()
+
+
+def _search_mailboxes(index, account: Optional[str], mailbox: str):
+    """[(account name, [(mailbox name, Mailbox)])] in the script's order."""
+    if account:
+        uuid = envelope_index.account_uuid(account)
+        accounts = [(name, u) for name, u in envelope_index.mail_accounts() if u == uuid][:1]
+    else:
+        accounts = envelope_index.mail_accounts()
+    if mailbox == "All":
+        skip = {fold(name) for name in SEARCH_SKIP_FOLDERS}
+        tree = dict(envelope_index.mailbox_tree(account, with_subs=False))
+        found = []
+        for name, uuid in accounts:
+            boxes = []
+            for mailbox_name, _ in tree.get(name, []):
+                box = index.find_mailbox(uuid, mailbox_name)
+                if box is not None and fold(mailbox_name) not in skip:
+                    boxes.append((mailbox_name, box))
+            found.append((name, boxes))
+        return found
+    found = []
+    for name, uuid in accounts:
+        box = envelope_index.resolve_mailbox(index, uuid, mailbox)
+        found.append((name, [(box.name, box)]))
+    return found
+
+
+def _record_line(message, mailbox_name: str, account_name: str) -> str:
+    def field(value) -> str:
+        # the script's sanitize_field
+        return re.sub(r"[\r\n\t\x1f\x1e]", " ", str(value))
+
+    return FIELD_SEP.join(
+        [
+            str(message.id),
+            field(message.internet_message_id),
+            field(message.subject),
+            field(message.sender),
+            field(mailbox_name),
+            field(account_name),
+            "true" if message.read else "false",
+            envelope_index.iso_datetime(message.date_received),
+            str(message.flag_index),
+            "",
+        ]
+    )
+
+
+def _search_records_from_index(
+    account, mailbox, subject_terms, sender, has_attachments, flagged, flag_index,
+    read_status, date_from, date_to, offset, limit, body_text,
+) -> Tuple[List[Dict[str, Any]], bool, Dict[str, str]]:
+    """(records, incomplete, bodies read) as the search script would find them."""
+    index = envelope_index.get_index()
+    filters: Dict[str, Any] = dict(
+        subject_contains_any=subject_terms or None,
+        sender_contains=sender or None,
+        flagged=flagged,
+        flag_index=flag_index,
+    )
+    if read_status != "all":
+        filters["read"] = read_status == "read"
+    if date_from:
+        filters["received_from"] = _day_start(date_from)
+    if date_to:
+        filters["received_to"] = _day_start(date_to) + 86399
+    if body_text is None and has_attachments is not None:
+        filters["has_attachments"] = has_attachments
+
+    layout = _search_mailboxes(index, account, mailbox)
+
+    incomplete = False
+    body_texts: Dict[str, str] = {}
+    if body_text is not None:
+        deadline = time.monotonic() + BODY_SEARCH_BUDGET_S
+        candidates = [
+            (account_name, mailbox_name, [str(m.id) for m in index.messages([box.id], **filters)])
+            for account_name, boxes in layout
+            for mailbox_name, box in boxes
+        ]
+        body_texts, incomplete = _match_bodies(
+            candidates, body_text, has_attachments, offset + limit + 1,
+            deadline - BODY_SEARCH_FETCH_RESERVE_S,
+        )
+        wanted_ids = set(list(body_texts)[offset:offset + limit + 1])
+        if not wanted_ids:
+            return [], incomplete, body_texts
+        skip, collect = 0, len(wanted_ids)
+    else:
+        wanted_ids = None
+        skip, collect = offset, limit + 1
+
+    lines = []
+    for account_name, boxes in layout:
+        for mailbox_name, box in boxes:
+            if collect <= 0:
+                break
+            if wanted_ids is not None:
+                filters["ids"] = [int(i) for i in wanted_ids]
+            matching = index.count([box.id], **filters)
+            if skip >= matching:
+                skip -= matching
+                continue
+            page = index.messages([box.id], **filters, limit=collect, offset=skip)
+            skip = 0
+            collect -= len(page)
+            lines += [_record_line(m, mailbox_name, account_name) for m in page]
+    return _parse_search_records(clean_script_output(RECORD_SEP.join(lines))), incomplete, body_texts
+
+
+THREAD_RULE = "\u2501" * 40
+
+
+def _email_thread_from_index(account, mailbox, keyword, max_messages, nonce) -> str:
+    """get_email_thread's report from the index (the script's collection order)."""
+    if not keyword:
+        raise IndexUnavailable("empty keyword")
+    index = envelope_index.get_index()
+    uuid = envelope_index.account_uuid(account)
+    box = index.find_mailbox(uuid, mailbox)
+    if box is None and mailbox == "INBOX":
+        box = index.find_mailbox(uuid, "Inbox")
+    if box is not None:
+        boxes = [box]
+    elif mailbox == "All":
+        boxes = []
+        for _, mailboxes in envelope_index.mailbox_tree(account, with_subs=False):
+            for mailbox_name, _ in mailboxes:
+                found = index.find_mailbox(uuid, mailbox_name)
+                if found is not None:
+                    boxes.append(found)
+    else:
+        raise IndexUnavailable(f"mailbox {mailbox!r} not in the index")
+
+    thread = []
+    for box in boxes:
+        if len(thread) >= max_messages:
+            break
+        thread += index.messages([box.id], subject_contains_any=[keyword], limit=max_messages - len(thread))
+
+    dates = envelope_index.date_strings(m.date_received for m in thread)
+    out = f"EMAIL THREAD VIEW\n\nThread topic: {keyword}\nAccount: {account}\n\n"
+    out += f"{THREAD_RULE}\nFOUND {len(thread)} MESSAGE(S) IN THREAD\n{THREAD_RULE}\n\n"
+    for message in thread:
+        indicator = "\u2713" if message.read else "\u2709"
+        out += f"{indicator} {message.subject}\n"
+        out += f"   From: {message.sender}\n"
+        out += f"   Date: {dates[message.date_received]}\n"
+        out += f"   Preview: \u27e6body:{nonce}:{message.id}|{account}|{mailbox}\u27e7\n"
+        out += "\n"
+    return fill_body_tokens(clean_script_output(out), 150, nonce, missing=None)

@@ -22,6 +22,11 @@ of messages a call touches:
   renders HTML on Mail's main thread and can freeze or crash it. Without
   Full Disk Access it falls back to Mail's raw `source` of each message,
   which is slower.
+- Listings, counts and searches read Mail's `Envelope Index` database
+  (read-only) instead of asking Mail for every message. Without Full Disk
+  Access, or when the database looks different, the server logs
+  `not using Mail's Envelope Index (...)` to stderr once and uses
+  AppleScript, which is slow on large mailboxes.
 - The server kills a call after 120 s (180 s for `search_emails`) and returns
   `AppleScript execution timed out after Ns ...`.
 
