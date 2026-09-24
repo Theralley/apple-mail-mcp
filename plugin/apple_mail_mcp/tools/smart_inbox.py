@@ -215,7 +215,9 @@ def get_awaiting_reply(
                             set foundReply to false
                             set idx to 1
                             repeat with inboxSubj in inboxSubjects
-                                if inboxSubj contains lowerBase or lowerBase contains inboxSubj then
+                                -- contents of: compare the text, not the list-item reference
+                                set inboxText to contents of inboxSubj
+                                if inboxText contains lowerBase or lowerBase contains inboxText then
                                     set inboxSender to item idx of inboxSenders
                                     if inboxSender contains lowerRecipAddr then
                                         set foundReply to true
@@ -370,7 +372,9 @@ def get_needs_response(
                             set lowerBase to my lowercase(baseSubject)
                             set alreadyReplied to false
                             repeat with sentSubj in sentSubjects
-                                if sentSubj contains lowerBase or lowerBase contains sentSubj then
+                                -- contents of: compare the text, not the list-item reference
+                                set sentText to contents of sentSubj
+                                if sentText contains lowerBase or lowerBase contains sentText then
                                     set alreadyReplied to true
                                     exit repeat
                                 end if

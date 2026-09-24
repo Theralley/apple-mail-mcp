@@ -271,22 +271,54 @@ class EnvelopeIndex:
         return {row[0] for row in self.query("SELECT DISTINCT source FROM mailboxes WHERE source IS NOT NULL")}
 
     def find_mailbox(self, account_uuid: str, path: str) -> Optional[Mailbox]:
-        """The mailbox at *path* ("INBOX", "Projects/2024") of an account.
+        """The mailbox Mail means by ``mailbox "<path>"`` of an account.
 
-        Mail shows the children of Gmail's "[Gmail]" container (All Mail,
-        Sent Mail, Trash, localised) as top-level mailboxes, so a name with
-        no exact match also matches "[<container>]/<name>".
+        A nested mailbox is not found by its name alone here (that is only
+        for names Mail itself listed, see resolve_listed).
+        """
+        found = self._candidates(account_uuid, path, nested=False)
+        return found[0] if found else None
+
+    def resolve_listed(self, account_uuid: str, names: Sequence[str]) -> List[Optional[Mailbox]]:
+        """The mailboxes behind the names of ``every mailbox of <account>``.
+
+        Mail lists more than the top level there: every mailbox of an
+        Exchange account, nested ones under their own name ("Notes" for
+        "Inbox/Notes"), and the children of Gmail's "[Gmail]". Each listed
+        name takes the best match not taken by an earlier name, so two
+        listed "Notes" become "Notes" and "Inbox/Notes".
+        """
+        taken: set = set()
+        resolved: List[Optional[Mailbox]] = []
+        for name in names:
+            match = next((m for m in self._candidates(account_uuid, name) if m.id not in taken), None)
+            if match is not None:
+                taken.add(match.id)
+            resolved.append(match)
+        return resolved
+
+    def _candidates(self, account_uuid: str, path: str, nested: bool = True) -> List[Mailbox]:
+        """Mailboxes *path* can mean, best first.
+
+        1. the exact path ("INBOX", "Projects/2024");
+        2. a child of a "[...]" container, which Mail shows at the top
+           ("[Gmail]/All Mail" as "All Mail");
+        3. a nested mailbox with that name ("Inbox/Projects" as
+           "Projects"), oldest first.
         """
         wanted = fold(path)
         mailboxes = [m for m in self.mailboxes() if m.account_uuid == account_uuid]
-        for mailbox in mailboxes:
-            if fold(mailbox.path) == wanted:
-                return mailbox
+        exact, container_child, nested_found = [], [], []
         for mailbox in mailboxes:
             parent, _, leaf = mailbox.path.rpartition("/")
-            if parent.startswith("[") and parent.endswith("]") and "/" not in parent and fold(leaf) == wanted:
-                return mailbox
-        return None
+            if fold(mailbox.path) == wanted:
+                exact.append(mailbox)
+            elif fold(leaf) == wanted and parent:
+                if parent.startswith("[") and parent.endswith("]") and "/" not in parent:
+                    container_child.append(mailbox)
+                else:
+                    nested_found.append(mailbox)
+        return exact + container_child + (nested_found if nested else [])
 
     # -- messages ----------------------------------------------------------
 

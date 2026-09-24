@@ -48,6 +48,8 @@ MAILBOXES = [
     (3, "ews://UUID-W/Inbox/Projects"),
     (4, "ews://UUID-W/Deleted%20Items"),
     (5, "ews://UUID-W/Archive"),
+    (6, "ews://UUID-W/Notes"),
+    (7, "ews://UUID-W/Inbox/Notes"),
     (10, "imap://UUID-G/%5BGmail%5D/All%20Mail"),
     (11, "imap://UUID-G/INBOX"),
     (12, "imap://UUID-G/Kva%CC%88tton"),  # "Kvätton" with a decomposed "ä"
@@ -86,6 +88,7 @@ MESSAGES = [
     (202, "me", None, "Proposal", NOW - 900, NOW - 900, 2, 1, 0, 0, 0, "<s2@example.com>", 0),
     (203, "me", None, "Receipt", NOW - 800, NOW - 800, 2, 1, 0, 0, 0, "<s3@example.com>", 0),
     (301, "alice", "Re: ", "Budget?", NOW - 150, NOW - 150, 3, 1, 0, 0, 0, "<a2@example.com>", 7),
+    (701, "bob", None, "Filed note", NOW - 160, NOW - 160, 7, 0, 0, 0, 0, None, 0),
     (1001, "eve", None, "Hello ||| there", NOW - 10, NOW - 10, 10, 0, 0, 0, 0, "<e1@example.org>", 0),
     (1002, "eve", None, "Only in All Mail", NOW - 20, NOW - 20, 10, 1, 0, 0, 0, "<e2@example.org>", 0),
     (1003, "eve", None, "Deleted label", NOW - 5, NOW - 5, 10, 0, 0, 0, 1, "<e3@example.org>", 0),
@@ -672,3 +675,35 @@ def test_swedish_special_folders_in_shared_constants():
     assert {"Skickat", "Skickade meddelanden"} <= set(constants.SENT_MAILBOX_NAMES)
     assert constants.SENT_MAILBOX_NAMES[:3] == ["Sent Messages", "Sent", "Sent Items"]
     assert "All e-post" in constants.ALL_MAIL_NAMES
+
+
+def test_exchange_lists_nested_mailboxes_by_their_own_name(mail_db, monkeypatch):
+    """Mail lists every mailbox of an Exchange account at the top, nested ones
+    under their own name; two listed "Notes" are "Notes" and "Inbox/Notes"."""
+    monkeypatch.setattr(
+        envelope_index, "mailbox_tree",
+        lambda account=None, with_subs=True: [("Work", [
+            ("Inbox", ["Projects", "Notes"] if with_subs else []),
+            ("Notes", []), ("Projects", []), ("Notes", []),
+        ])],
+    )
+    listed = inbox.list_mailboxes(account="Work")
+    assert "\n".join([
+        "  📂 Inbox (4 total, 3 unread)",
+        "    └─ Projects [Path: Inbox/Projects] (1 total, 0 unread)",
+        "    └─ Notes [Path: Inbox/Notes] (1 total, 1 unread)",
+        "  📂 Notes (0 total, 0 unread)",
+        "  📂 Projects (1 total, 0 unread)",
+        "  📂 Notes (1 total, 1 unread)",
+    ]) in listed
+    overview = inbox.get_inbox_overview()
+    assert "  📂 Inbox (3 unread)\n     └─ Notes (1 unread)\n  📂 Notes\n  📂 Projects\n  📂 Notes (1 unread)\n" in overview
+    # A name the user passes is still looked up as Mail's `mailbox "X"` would.
+    index = envelope_index.get_index()
+    assert index.find_mailbox("UUID-W", "Projects") is None
+
+
+def test_listed_names_resolve_each_mailbox_once(mail_db):
+    index = envelope_index.get_index()
+    resolved = index.resolve_listed("UUID-W", ["Notes", "Notes", "Notes", "Projects", "Missing"])
+    assert [box.path if box else None for box in resolved] == ["Notes", "Inbox/Notes", None, "Inbox/Projects", None]

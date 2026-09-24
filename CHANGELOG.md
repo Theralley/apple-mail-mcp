@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Skickat"). Both the AppleScript and the Envelope Index paths do this; the
   index recognises All Mail by its role (`mailboxes.source`), names are the
   fallback.
+- **`search_emails(mailbox="All")` skipped no folder.** Its script compared
+  each mailbox name with a `repeat with f in list` item reference, which is
+  never equal in AppleScript, so Trash, Junk, Sent and Drafts were always
+  searched. It now uses `is in`.
+- **Nested mailboxes listed by Mail at the top** (Exchange accounts list
+  every mailbox under its own name, e.g. "Inbox/Notes" as "Notes") are
+  matched to the right mailbox in the Envelope Index, each once.
 - **Message bodies are read from disk; the server never asks Mail for
   `content`.** `content of <message>` makes Mail convert HTML to text through
   legacy WebKit (NSHTMLReader) on its main thread. That cost 0.35-0.7 s per

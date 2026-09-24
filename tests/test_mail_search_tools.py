@@ -879,6 +879,10 @@ class SharedDecisionTests(unittest.TestCase):
             [(i["message_id"], i["mailbox"]) for i in payload["items"]], [("5", "INBOX"), ("6", "All e-post")]
         )
         self.assertIn('"Papperskorgen"', scripts[0])  # Swedish Trash is skipped
+        # A name compared with a `repeat with f in list` item reference is never
+        # equal in AppleScript; `is in` compares the text.
+        self.assertIn('if mailboxName is in {"Trash", ', scripts[0])
+        self.assertNotIn("repeat with skipFolder", scripts[0])
         self.assertIn('"Skickat"', scripts[0])
         self.assertIn("(id is 5 or id is 6)", scripts[1])
         self.assertIn("set collectLimit to 4", scripts[1])  # both copies of 5 can arrive

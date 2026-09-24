@@ -878,14 +878,22 @@ def _inbox_records_from_index(
     return emails
 
 
+def _sub_mailbox(index, uuid: str, parent, path: str, sub_name: str):
+    """The child *sub_name* of a listed mailbox (whose own path may be longer)."""
+    if parent is not None:
+        child = index.find_mailbox(uuid, f"{parent.path}/{sub_name}")
+        if child is not None:
+            return child
+    return index.find_mailbox(uuid, path)
+
+
 def _list_mailboxes_from_index(account: Optional[str], include_counts: bool) -> str:
     index = envelope_index.get_index()
     tree = envelope_index.mailbox_tree(account)
 
-    def counts(uuid: str, path: str) -> str:
+    def counts(mailbox) -> str:
         if not include_counts:
             return ""
-        mailbox = index.find_mailbox(uuid, path)
         total, unread = index.counts([mailbox.id]) if mailbox is not None else (0, 0)
         return f" ({total} total, {unread} unread)"
 
@@ -895,11 +903,12 @@ def _list_mailboxes_from_index(account: Optional[str], include_counts: bool) -> 
             continue
         uuid = envelope_index.account_uuid(account_name)
         out += f"{RULE}\n📁 ACCOUNT: {account_name}\n{RULE}\n\n"
-        for mailbox_name, sub_names in mailboxes:
-            out += f"  📂 {mailbox_name}{counts(uuid, mailbox_name)}\n"
+        listed = index.resolve_listed(uuid, [name for name, _ in mailboxes])
+        for (mailbox_name, sub_names), box in zip(mailboxes, listed):
+            out += f"  📂 {mailbox_name}{counts(box)}\n"
             for sub_name in sub_names:
                 path = f"{mailbox_name}/{sub_name}"
-                out += f"    └─ {sub_name} [Path: {path}]{counts(uuid, path)}\n"
+                out += f"    └─ {sub_name} [Path: {path}]{counts(_sub_mailbox(index, uuid, box, path, sub_name))}\n"
         out += "\n"
     return clean_script_output(out)
 
@@ -933,18 +942,18 @@ def _inbox_overview_from_index() -> str:
         out += f"\nAccount: {account_name}\n"
         uuid = envelope_index.account_uuid(account_name)
 
-        def unread_of(path: str) -> int:
-            mailbox = index.find_mailbox(uuid, path)
+        def unread_of(mailbox) -> int:
             return index.counts([mailbox.id])[1] if mailbox is not None else 0
 
-        for mailbox_name, sub_names in mailboxes:
-            unread = unread_of(mailbox_name)
+        listed = index.resolve_listed(uuid, [name for name, _ in mailboxes])
+        for (mailbox_name, sub_names), box in zip(mailboxes, listed):
+            unread = unread_of(box)
             if unread > 0:
                 out += f"  📂 {mailbox_name} ({unread} unread)\n"
             else:
                 out += f"  📂 {mailbox_name}\n"
             for sub_name in sub_names:
-                sub_unread = unread_of(f"{mailbox_name}/{sub_name}")
+                sub_unread = unread_of(_sub_mailbox(index, uuid, box, f"{mailbox_name}/{sub_name}", sub_name))
                 if sub_unread > 0:
                     out += f"     └─ {sub_name} ({sub_unread} unread)\n"
     out += "\n\n"

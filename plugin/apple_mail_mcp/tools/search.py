@@ -314,14 +314,11 @@ def _search_mail_records(
                 set searchMailboxes to every mailbox of targetAccount
         """
         skip_names = ", ".join(f'"{escape_applescript(name)}"' for name in SKIP_FOLDERS)
+        # `is in` compares text. The loop this replaces compared the name with
+        # a list-item reference (`repeat with f in list` / `name is f`), which
+        # is never equal in AppleScript, so no folder was ever skipped.
         skip_script = """
-                        set skipFolders to {""" + skip_names + """}
-                        repeat with skipFolder in skipFolders
-                            if mailboxName is skipFolder then
-                                set shouldSkip to true
-                                exit repeat
-                            end if
-                        end repeat
+                        if mailboxName is in {""" + skip_names + """} then set shouldSkip to true
         """
     else:
         escaped_mailbox = escape_applescript(mailbox)
@@ -1017,11 +1014,12 @@ def _search_mailboxes(index, account: Optional[str], mailbox: str):
         tree = dict(envelope_index.mailbox_tree(account, with_subs=False))
         found = []
         for name, uuid in accounts:
-            boxes = []
-            for mailbox_name, _ in tree.get(name, []):
-                box = index.find_mailbox(uuid, mailbox_name)
-                if box is not None and fold(mailbox_name) not in skip:
-                    boxes.append((mailbox_name, box))
+            names = [mailbox_name for mailbox_name, _ in tree.get(name, [])]
+            boxes = [
+                (mailbox_name, box)
+                for mailbox_name, box in zip(names, index.resolve_listed(uuid, names))
+                if box is not None and fold(mailbox_name) not in skip
+            ]
             found.append((name, boxes))
         return found
     found = []
@@ -1142,10 +1140,8 @@ def _email_thread_from_index(account, mailbox, keyword, max_messages, nonce) -> 
     elif mailbox == "All":
         boxes = []
         for _, mailboxes in envelope_index.mailbox_tree(account, with_subs=False):
-            for mailbox_name, _ in mailboxes:
-                found = index.find_mailbox(uuid, mailbox_name)
-                if found is not None:
-                    boxes.append(found)
+            listed = index.resolve_listed(uuid, [name for name, _ in mailboxes])
+            boxes += [found for found in listed if found is not None]
     else:
         raise IndexUnavailable(f"mailbox {mailbox!r} not in the index")
 

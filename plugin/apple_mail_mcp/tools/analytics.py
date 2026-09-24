@@ -690,11 +690,9 @@ def _counted_mailboxes(index, account: str):
     uuid = envelope_index.account_uuid(account)
     skip = {fold(name) for name in SKIP_FOLDERS}
     for _, mailboxes in envelope_index.mailbox_tree(account, with_subs=False):
-        for mailbox_name, _ in mailboxes:
-            if fold(mailbox_name) in skip:
-                continue
-            mailbox = index.find_mailbox(uuid, mailbox_name)
-            if mailbox is not None:
+        names = [name for name, _ in mailboxes]
+        for mailbox_name, mailbox in zip(names, index.resolve_listed(uuid, names)):
+            if mailbox is not None and fold(mailbox_name) not in skip:
                 yield mailbox_name, mailbox
 
 
