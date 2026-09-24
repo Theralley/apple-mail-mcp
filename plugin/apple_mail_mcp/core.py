@@ -8,6 +8,7 @@ import threading
 from typing import Optional, List, Dict, Any, Tuple
 
 from apple_mail_mcp.server import USER_PREFERENCES
+from apple_mail_mcp.app_lock import AppBusyError, app_lock
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +182,15 @@ def run_applescript(script: str, timeout: int = 120) -> str:
        handler and chained SIGTERM/SIGHUP handlers call kill() on any survivors
        so graceful-exit paths also clean up.
     """
+    # Only one client drives Mail at a time, across every MCP server process.
+    try:
+        with app_lock("Mail"):
+            return _run_applescript_unlocked(script, timeout)
+    except AppBusyError as e:
+        raise Exception(str(e))
+
+
+def _run_applescript_unlocked(script: str, timeout: int) -> str:
     # Ensure signal/atexit handlers are registered (idempotent, main-thread only).
     _register_cleanup_once()
 
