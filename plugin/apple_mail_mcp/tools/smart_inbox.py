@@ -708,10 +708,14 @@ def _sent_mailbox(index, uuid: str):
 def _awaiting_reply_from_index(account, days_back, exclude_noreply, max_results) -> str:
     index = envelope_index.get_index()
     uuid = envelope_index.account_uuid(account)
+    # The script's answers when a mailbox is missing (Sent is looked up first)
     sent_box = _sent_mailbox(index, uuid)
+    if sent_box is None:
+        return f"Error: Could not find Sent mailbox for account {account}"
     inbox = envelope_index.find_inbox(index, uuid)
-    if sent_box is None or inbox is None:
-        raise IndexUnavailable("the script reports the missing mailbox")
+    if inbox is None:
+        canonical = next(name for name, u in envelope_index.mail_accounts() if u == uuid)
+        return f"Error: No inbox mailbox found for account {canonical}"
     cutoff = envelope_index.days_back_cutoff(days_back)
 
     inbox_keys = []

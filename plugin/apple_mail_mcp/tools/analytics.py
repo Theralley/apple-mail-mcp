@@ -824,6 +824,11 @@ def _statistics_from_index(account, scope, sender, mailbox, days_back) -> str:
     index = envelope_index.get_index()
     cutoff = envelope_index.days_back_cutoff(days_back)
 
+    # A Gmail message is in All Mail and in each mailbox it is labelled with,
+    # which are all top-level mailboxes here. The scripts count it once per
+    # mailbox; these totals count each message once (`seen`).
+    seen: set = set()
+
     if scope == "account_overview":
         total = unread = flagged = with_attachments = 0
         senders: list = []  # [sender, count], first seen first, as the script keeps them
@@ -832,7 +837,12 @@ def _statistics_from_index(account, scope, sender, mailbox, days_back) -> str:
         for mailbox_name, box in _counted_mailboxes(index, account):
             messages = index.messages([box.id], received_after=cutoff)
             attached = index.with_attachments(m.id for m in messages)
+            if messages:
+                mailbox_counts.append((mailbox_name, len(messages)))
             for message in messages:
+                if message.id in seen:
+                    continue
+                seen.add(message.id)
                 total += 1
                 if not message.read:
                     unread += 1
@@ -846,8 +856,6 @@ def _statistics_from_index(account, scope, sender, mailbox, days_back) -> str:
                 else:
                     sender_slot[key] = len(senders)
                     senders.append([message.sender, 1])
-            if messages:
-                mailbox_counts.append((mailbox_name, len(messages)))
         read = total - unread
 
         out = "╔══════════════════════════════════════════╗\n"
@@ -878,7 +886,11 @@ def _statistics_from_index(account, scope, sender, mailbox, days_back) -> str:
     if scope == "sender_stats":
         total = unread = with_attachments = 0
         for _, box in _counted_mailboxes(index, account):
-            messages = index.messages([box.id], sender_contains=sender, received_after=cutoff)
+            messages = [
+                m for m in index.messages([box.id], sender_contains=sender, received_after=cutoff)
+                if m.id not in seen
+            ]
+            seen.update(m.id for m in messages)
             attached = index.with_attachments(m.id for m in messages)
             total += len(messages)
             unread += sum(1 for m in messages if not m.read)

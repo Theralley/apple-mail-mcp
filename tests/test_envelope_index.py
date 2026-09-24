@@ -34,7 +34,7 @@ CREATE TABLE messages (ROWID INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEG
     global_message_id INTEGER NOT NULL, sender INTEGER, subject_prefix TEXT, subject INTEGER NOT NULL,
     date_sent INTEGER, date_received INTEGER, mailbox INTEGER NOT NULL, flags INTEGER NOT NULL DEFAULT 0,
     read INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0, deleted INTEGER NOT NULL DEFAULT 0,
-    size INTEGER NOT NULL DEFAULT 0, conversation_id INTEGER NOT NULL DEFAULT 0);
+    size INTEGER NOT NULL DEFAULT 0, conversation_id INTEGER NOT NULL DEFAULT 0, type INTEGER);
 CREATE TABLE labels (message_id INTEGER, mailbox_id INTEGER, PRIMARY KEY(message_id, mailbox_id)) WITHOUT ROWID;
 CREATE TABLE recipients (ROWID INTEGER PRIMARY KEY, message INTEGER NOT NULL, address INTEGER NOT NULL,
     type INTEGER, position INTEGER);
@@ -51,17 +51,19 @@ MAILBOXES = [
     (10, "imap://UUID-G/%5BGmail%5D/All%20Mail"),
     (11, "imap://UUID-G/INBOX"),
     (12, "imap://UUID-G/Kva%CC%88tton"),  # "Kvätton" with a decomposed "ä"
+    (13, "imap://UUID-G/Notes"),
 ]
 ACCOUNTS = [("Work", "UUID-W"), ("Gmail", "UUID-G")]
 TREE = [
     ("Work", [("Inbox", ["Projects"]), ("Sent Items", []), ("Deleted Items", []), ("Archive", [])]),
-    ("Gmail", [("INBOX", []), ("[Gmail]", ["All Mail"]), ("Kvätton", [])]),
+    # Mail lists the children of "[Gmail]" as top-level mailboxes
+    ("Gmail", [("INBOX", []), ("All Mail", []), ("Kvätton", []), ("Notes", [])]),
 ]
 ADDRESSES = {
     "alice": ("alice@example.com", "Alice"),
     "bob": ("bob@example.com", ""),
     "news": ("news@substack.com", "Weekly"),
-    "carol": ("carol@example.com", "Carol"),
+    "carol": ("carol@example.com", "Carol, Inc"),
     "dave": ("dave@example.com", "Dave D"),
     "noreply": ("noreply@shop.example", ""),
     "eve": ("eve@example.org", "Eve"),
@@ -84,8 +86,10 @@ MESSAGES = [
     (1002, "eve", None, "Only in All Mail", NOW - 20, NOW - 20, 10, 1, 0, 0, 0, "<e2@example.org>", 0),
     (1003, "eve", None, "Deleted label", NOW - 5, NOW - 5, 10, 0, 0, 0, 1, "<e3@example.org>", 0),
     (1201, "eve", None, "Receipt April", NOW - 30, NOW - 30, 12, 1, 0, 0, 0, None, 0),
+    (1004, "eve", None, "A note", NOW - 15, NOW - 15, 10, 1, 0, 0, 0, None, 0),
 ]
-LABELS = [(1001, 11), (1003, 11)]
+LABELS = [(1001, 11), (1003, 11), (1004, 13)]
+NOTES = {1004}  # messages.type 2: an Apple Notes note in the "Notes" folder
 RECIPIENTS = [(201, "bob", 0, 0), (201, "carol", 1, 0), (202, "dave", 0, 0), (203, "noreply", 0, 0)]
 ATTACHMENTS = [101, 101, 301]
 
@@ -109,10 +113,10 @@ def build_index(path, drop_column=None):
         ).lastrowid
         con.execute(
             "INSERT INTO messages (ROWID, global_message_id, sender, subject_prefix, subject, date_sent,"
-            " date_received, mailbox, flags, read, flagged, deleted, conversation_id)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " date_received, mailbox, flags, read, flagged, deleted, conversation_id, type)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (rowid, global_id, address_ids[sender], prefix, subject_ids[subject], sent, received,
-             mailbox, flags, read, flagged, deleted, conversation),
+             mailbox, flags, read, flagged, deleted, conversation, 2 if rowid in NOTES else 0),
         )
     con.executemany("INSERT INTO labels VALUES (?, ?)", LABELS)
     con.executemany(
@@ -283,7 +287,8 @@ def test_gmail_labels_put_messages_in_inbox(mail_db):
     inbox_box = envelope_index.find_inbox(index, "UUID-G")
     assert inbox_box.id == 11 and inbox_box.path == "INBOX"
     assert ids(index.messages([11])) == [1001]  # labelled; 1002 is only in All Mail, 1003 deleted
-    assert ids(index.messages([10])) == [1001, 1002]
+    assert ids(index.messages([10])) == [1001, 1004, 1002]  # All Mail lists the note it stores
+    assert ids(index.messages([13])) == []  # but Mail does not list it in "Notes"
     assert index.counts([11]) == (1, 1)
 
 
@@ -319,6 +324,8 @@ def test_filters(mail_db):
 def test_mailbox_paths_are_decoded_and_normalised(mail_db):
     index = envelope_index.get_index()
     assert index.find_mailbox("UUID-G", "[Gmail]/All Mail").id == 10
+    assert index.find_mailbox("UUID-G", "all mail").id == 10  # as Mail names it
+    assert index.find_mailbox("UUID-W", "Projects") is None  # only "[...]" containers flatten
     assert index.find_mailbox("UUID-G", "kvätton").id == 12  # NFC query, NFD url
     assert index.find_mailbox("UUID-W", "Inbox/Projects").id == 3
     assert index.find_mailbox("UUID-W", "INBOX").id == 1
@@ -400,7 +407,9 @@ def test_list_mailboxes(mail_db):
         "  📂 Archive (0 total, 0 unread)",
     ])
     gmail = inbox.list_mailboxes(account="Gmail", include_counts=False)
-    assert "  📂 [Gmail]\n    └─ All Mail [Path: [Gmail]/All Mail]\n  📂 Kvätton" in gmail
+    assert "  📂 INBOX\n  📂 All Mail\n  📂 Kvätton\n  📂 Notes" in gmail
+    counted = inbox.list_mailboxes(account="Gmail")
+    assert "  📂 All Mail (3 total, 1 unread)\n  📂 Kvätton (1 total, 0 unread)\n  📂 Notes (0 total, 0 unread)" in counted
 
 
 def test_inbox_overview(mail_db):
@@ -408,7 +417,7 @@ def test_inbox_overview(mail_db):
     assert "  ⚠️  Work: 3 unread (4 total)\n  ⚠️  Gmail: 1 unread (1 total)\n" in result
     assert "📈 TOTAL UNREAD: 4 across all accounts" in result
     assert "Account: Work\n  📂 Inbox (3 unread)\n  📂 Sent Items\n" in result
-    assert "Account: Gmail\n  📂 INBOX (1 unread)\n  📂 [Gmail]\n     └─ All Mail (1 unread)\n" in result
+    assert "Account: Gmail\n  📂 INBOX (1 unread)\n  📂 All Mail (1 unread)\n  📂 Kvätton\n" in result
     # Ten per account are collected, the first ten shown: Work's four, then Gmail's.
     recent = result.split("(10 Most Recent)")[1]
     assert recent.index("✉ Budget?\n   Account: Work") < recent.index("✉ Hello ||| there\n   Account: Gmail")
@@ -466,7 +475,7 @@ def test_needs_response(mail_db):
         f"   Date: {date_of(-100)}",
         "",
         "2. [MEDIUM (contains question)] Old thing?",
-        "   From: Carol <carol@example.com>",
+        "   From: \"Carol, Inc\" <carol@example.com>",
         f"   Date: {date_of(-40 * DAY)}",
         "",
         "========================================",
@@ -502,7 +511,12 @@ def test_search_emails(mail_db):
 
     everywhere = json.loads(search.search_emails(mailbox="All", output_format="json", limit=50))
     # Sent Items and Deleted Items are skipped, sub-mailboxes are not searched
-    assert sorted(i["message_id"] for i in everywhere["items"]) == ["1001", "101", "102", "104", "105", "1201"]
+    # As the script: All Mail is searched too, so an inbox message is listed
+    # twice (INBOX and All Mail); Notes shows no note.
+    assert sorted((i["message_id"], i["mailbox"]) for i in everywhere["items"]) == [
+        ("1001", "All Mail"), ("1001", "INBOX"), ("1002", "All Mail"), ("1004", "All Mail"),
+        ("101", "Inbox"), ("102", "Inbox"), ("104", "Inbox"), ("105", "Inbox"), ("1201", "Kvätton"),
+    ]
 
     flagged = json.loads(search.search_emails(account="Work", flag_color="blue", output_format="json"))
     assert [(i["message_id"], i["flag_color"]) for i in flagged["items"]] == [("101", "blue")]
@@ -568,3 +582,33 @@ def test_dashboard_recent_emails(mail_db):
     assert [(e["subject"], e["account"]) for e in emails] == [
         ("Budget?", "Work"), ("Re: Lunch plans", "Work"), ("Hello ||| there", "Gmail"),
     ]
+
+
+def test_sender_names_with_specials_are_quoted():
+    assert envelope_index.format_sender("a@example.com", "Acme, Inc") == '"Acme, Inc" <a@example.com>'
+    assert envelope_index.format_sender("a@example.com", 'Say "hi"') == '"Say \\"hi\\"" <a@example.com>'
+    assert envelope_index.format_sender("a@example.com", "J. Doe") == "J. Doe <a@example.com>"
+    assert envelope_index.format_sender("a@example.com", "Åsa Öberg") == "Åsa Öberg <a@example.com>"
+    assert envelope_index.format_sender("a@example.com", "") == "a@example.com"
+
+
+def test_quoted_sender_in_listings_and_filters(mail_db):
+    emails = json.loads(inbox.list_inbox_emails(account="Work", output_format="json", max_emails=0))
+    assert '"Carol, Inc" <carol@example.com>' in [e["sender"] for e in emails]
+    index = envelope_index.get_index()
+    assert ids(index.messages([1], sender_contains='"carol, inc"')) == [105]
+
+
+def test_statistics_count_each_message_once(mail_db):
+    """The script counts a Gmail message once per mailbox it is in (a bug)."""
+    overview = analytics.get_statistics(account="Gmail", days_back=0)
+    assert "Total Emails: 4\n" in overview  # 1001 is in INBOX and All Mail: counted once
+    assert "INBOX: 1 (25%)\nAll Mail: 3 (75%)\nKvätton: 1 (25%)" in overview
+    sender = analytics.get_statistics(account="Gmail", scope="sender_stats", sender="eve", days_back=0)
+    assert "Total emails: 4\nUnread: 1\n" in sender
+
+
+def test_awaiting_reply_reports_missing_mailboxes_without_the_script(mail_db, monkeypatch):
+    assert smart_inbox.get_awaiting_reply(account="gmail") == "Error: Could not find Sent mailbox for account gmail"
+    monkeypatch.setattr(envelope_index, "find_inbox", lambda index, uuid: None)
+    assert smart_inbox.get_awaiting_reply(account="work") == "Error: No inbox mailbox found for account Work"

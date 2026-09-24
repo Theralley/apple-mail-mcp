@@ -66,7 +66,7 @@ from apple_mail_mcp import emlx
 REQUIRED_COLUMNS = {
     "messages": {
         "ROWID", "sender", "subject", "subject_prefix", "date_sent", "date_received",
-        "mailbox", "flags", "read", "flagged", "deleted", "conversation_id",
+        "mailbox", "flags", "read", "flagged", "deleted", "conversation_id", "type",
         "global_message_id",
     },
     "subjects": {"ROWID", "subject"},
@@ -83,6 +83,9 @@ REQUIRED_COLUMNS = {
 FLAG_COLOR_SHIFT = 39
 
 RECIPIENT_TO = 0
+
+# messages.type of a note that Apple Notes keeps in an IMAP "Notes" folder
+MESSAGE_TYPE_NOTE = 2
 
 # How long to wait before trying to open the database again after it failed.
 REOPEN_INTERVAL_S = 60
@@ -121,12 +124,20 @@ def contains_ci(haystack: Optional[str], needle: Optional[str]) -> bool:
     return fold(needle) in fold(haystack)
 
 
+# A display name holding one of these is quoted, as Mail does ("Doe, Jane"
+# <jane@...>). Mail leaves a name with a period unquoted.
+_NAME_SPECIALS = set(',;:<>()[]@\\"')
+
+
 def format_sender(address: Optional[str], name: Optional[str]) -> str:
     """The text AppleScript returns for ``sender of <message>``."""
     address = address or ""
-    if name:
-        return f"{name} <{address}>"
-    return address
+    if not name:
+        return address
+    if _NAME_SPECIALS & set(name):
+        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+        name = f'"{escaped}"'
+    return f"{name} <{address}>"
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +221,7 @@ class EnvelopeIndex:
         self.conn = sqlite3.connect(uri, uri=True, timeout=2.0, check_same_thread=False)
         self.conn.execute("PRAGMA query_only = ON")
         self.conn.create_function("contains_ci", 2, contains_ci, deterministic=True)
+        self.conn.create_function("format_sender", 2, format_sender, deterministic=True)
         self._lock = threading.Lock()
         self._validate()
 
@@ -246,10 +258,20 @@ class EnvelopeIndex:
         return found
 
     def find_mailbox(self, account_uuid: str, path: str) -> Optional[Mailbox]:
-        """The mailbox at *path* ("INBOX", "Projects/2024") of an account."""
+        """The mailbox at *path* ("INBOX", "Projects/2024") of an account.
+
+        Mail shows the children of Gmail's "[Gmail]" container (All Mail,
+        Sent Mail, Trash, localised) as top-level mailboxes, so a name with
+        no exact match also matches "[<container>]/<name>".
+        """
         wanted = fold(path)
-        for mailbox in self.mailboxes():
-            if mailbox.account_uuid == account_uuid and fold(mailbox.path) == wanted:
+        mailboxes = [m for m in self.mailboxes() if m.account_uuid == account_uuid]
+        for mailbox in mailboxes:
+            if fold(mailbox.path) == wanted:
+                return mailbox
+        for mailbox in mailboxes:
+            parent, _, leaf = mailbox.path.rpartition("/")
+            if parent.startswith("[") and parent.endswith("]") and "/" not in parent and fold(leaf) == wanted:
                 return mailbox
         return None
 
@@ -313,9 +335,12 @@ class EnvelopeIndex:
         marks = ",".join("?" * len(mailbox_ids))
         clauses = [
             "m.deleted = 0",
-            # stored in the mailbox, or (Gmail) labelled with it
+            # Stored in the mailbox, or (Gmail) labelled with it. Mail does not
+            # list notes (type 2, Apple Notes over IMAP) in a label mailbox
+            # such as "Notes", though All Mail, where they are stored, counts them.
             f"m.ROWID IN (SELECT ROWID FROM messages WHERE mailbox IN ({marks}) "
-            f"UNION SELECT message_id FROM labels WHERE mailbox_id IN ({marks}))",
+            f"UNION SELECT l.message_id FROM labels l JOIN messages lm ON lm.ROWID = l.message_id "
+            f"WHERE l.mailbox_id IN ({marks}) AND coalesce(lm.type, 0) != {MESSAGE_TYPE_NOTE})",
         ]
         params: list = mailbox_ids + mailbox_ids
         if unread_only:
@@ -336,10 +361,7 @@ class EnvelopeIndex:
             clauses.append("m.date_sent > ?")
             params.append(sent_after)
         if sender_contains:
-            clauses.append(
-                "contains_ci(CASE WHEN a.comment != '' THEN a.comment || ' <' || a.address || '>' "
-                "ELSE a.address END, ?)"
-            )
+            clauses.append("contains_ci(format_sender(a.address, a.comment), ?)")
             params.append(sender_contains)
         if subject_contains_any:
             terms = [t for t in subject_contains_any if t]
