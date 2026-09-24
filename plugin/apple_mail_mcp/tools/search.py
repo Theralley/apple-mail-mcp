@@ -10,6 +10,10 @@ from urllib.parse import quote
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.constants import FLAG_COLOR_NAMES
 from apple_mail_mcp.core import (
+    AS_FIELD_SEP,
+    AS_RECORD_SEP,
+    FIELD_SEP,
+    RECORD_SEP,
     contains_any_condition,
     inject_preferences,
     escape_applescript,
@@ -25,13 +29,17 @@ from apple_mail_mcp.emlx import (
     fill_body_tokens,
     get_message,
     get_message_body,
+    new_body_nonce,
     preview,
 )
 
 
-# Seconds a body_text search may spend reading message bodies before it stops
-# and returns what it found so far (the osascript call itself is killed at 180).
+# Seconds a whole body_text search may take - listing candidates, reading
+# bodies (source fallbacks included) and fetching the matches' metadata -
+# before it stops and returns what it found so far. The last
+# BODY_SEARCH_FETCH_RESERVE_S of it are kept for the metadata fetch.
 BODY_SEARCH_BUDGET_S = 120
+BODY_SEARCH_FETCH_RESERVE_S = 20
 BODY_SEARCH_INCOMPLETE_NOTE = (
     f"Body search stopped after {BODY_SEARCH_BUDGET_S}s before scanning every "
     "message; results may be incomplete. Narrow it with date_from/date_to, "
@@ -77,14 +85,22 @@ def _build_applescript_date(
     """
 
 
+def _timed_out(exc: Exception, deadline: float) -> bool:
+    return "timed out" in str(exc) or time.monotonic() >= deadline
+
+
 def _parse_search_records(output: str) -> List[Dict[str, Any]]:
-    """Parse structured search output into dict records."""
+    """Parse structured search output into dict records.
+
+    Fields are separated by FIELD_SEP and records by RECORD_SEP, so a subject
+    or mailbox name can hold any printable text.
+    """
     if not output:
         return []
 
     records = []
-    for line in output.splitlines():
-        parts = line.split("|||", 9)
+    for line in output.split(RECORD_SEP):
+        parts = line.split(FIELD_SEP, 9)
         if len(parts) < 9:
             continue
 
@@ -339,9 +355,14 @@ def _search_mail_records(
     script_offset = offset
     collect_limit = limit + 1
     incomplete = False
+    deadline: Optional[float] = None
+    body_texts: Dict[str, str] = {}
 
     if use_body_search:
-        matched_ids, incomplete = _body_search_ids(
+        # One budget for the whole body search: listing candidates, reading
+        # bodies (source fallbacks included) and fetching the metadata below.
+        deadline = time.monotonic() + BODY_SEARCH_BUDGET_S
+        body_texts, incomplete = _body_search_ids(
             id_selection="id of ("
             + matching_messages_script.replace("set matchingMessages to ", "", 1)
             + ")",
@@ -352,8 +373,9 @@ def _search_mail_records(
             body_text=body_text,
             has_attachments=has_attachments,
             wanted=offset + limit + 1,
+            deadline=deadline,
         )
-        selected = matched_ids[offset:offset + limit + 1]
+        selected = list(body_texts)[offset:offset + limit + 1]
         if not selected:
             return [], incomplete
         message_collection = (
@@ -362,6 +384,12 @@ def _search_mail_records(
         )
         script_offset = 0
         collect_limit = len(selected)
+
+    timeout = 180
+    if deadline is not None:
+        timeout = int(deadline - time.monotonic())
+        if timeout < 1:
+            return [], True
 
     script = f'''
 
@@ -372,13 +400,9 @@ def _search_mail_records(
             set valueText to ""
         end try
 
-        set AppleScript's text item delimiters to {{return, linefeed, tab}}
+        set AppleScript's text item delimiters to {{return, linefeed, tab, {AS_FIELD_SEP}, {AS_RECORD_SEP}}}
         set valueParts to text items of valueText
         set AppleScript's text item delimiters to " "
-        set valueText to valueParts as string
-        set AppleScript's text item delimiters to "|||"
-        set valueParts to text items of valueText
-        set AppleScript's text item delimiters to " | "
         set valueText to valueParts as string
         set AppleScript's text item delimiters to ""
         return valueText
@@ -412,7 +436,7 @@ def _search_mail_records(
     end iso_datetime
 
     tell application "Mail"
-        with timeout of 180 seconds
+        with timeout of {timeout} seconds
             try
                 set recordLines to {{}}
                 set offsetRemaining to {script_offset}
@@ -472,7 +496,8 @@ def _search_mail_records(
                                                     set readValue to "true"
                                                 end if
 
-                                                set recordLine to messageId & "|||" & internetMessageId & "|||" & messageSubject & "|||" & messageSender & "|||" & mailboxName & "|||" & accountName & "|||" & readValue & "|||" & receivedAt & "|||" & (messageFlagIndex as string) & "|||" & contentPreview
+                                                set fs to {AS_FIELD_SEP}
+                                                set recordLine to messageId & fs & internetMessageId & fs & messageSubject & fs & messageSender & fs & mailboxName & fs & accountName & fs & readValue & fs & receivedAt & fs & (messageFlagIndex as string) & fs & contentPreview
                                                 set end of recordLines to recordLine
                                                 set collectLimit to collectLimit - 1
                                                 if collectLimit <= 0 then exit repeat
@@ -493,31 +518,36 @@ def _search_mail_records(
                     return ""
                 end if
 
-                set AppleScript's text item delimiters to linefeed
+                set AppleScript's text item delimiters to {AS_RECORD_SEP}
                 set outputText to recordLines as string
                 set AppleScript's text item delimiters to ""
                 return outputText
             on error errMsg
-                return "ERROR|||" & errMsg
+                return "ERROR" & {AS_FIELD_SEP} & errMsg
             end try
         end timeout
     end tell
     '''
 
-    result = run_applescript(script, timeout=180)
-    if result.startswith("ERROR|||"):
-        raise ValueError(result.split("|||", 1)[1])
+    try:
+        result = run_applescript(script, timeout=timeout)
+    except Exception as exc:
+        if deadline is not None and _timed_out(exc, deadline):
+            return [], True
+        raise
+    if result.startswith("ERROR" + FIELD_SEP):
+        raise ValueError(result.split(FIELD_SEP, 1)[1])
 
     records = _parse_search_records(result)
     if include_content:
         for record in records:
-            text = preview(
-                get_message_body(record["message_id"], record["account"], record["mailbox"]),
-                content_length,
-                strip_tabs=True,
-            )
+            if use_body_search:
+                body = body_texts.get(record["message_id"])  # already read above
+            else:
+                body = get_message_body(record["message_id"], record["account"], record["mailbox"])
+            text = preview(body, content_length, strip_tabs=True)
             if text:
-                record["content_preview"] = text.replace("|||", " | ").strip()
+                record["content_preview"] = text.strip()
     return records, incomplete
 
 
@@ -530,17 +560,24 @@ def _body_search_ids(
     body_text: str,
     has_attachments: Optional[bool],
     wanted: int,
-) -> Tuple[List[str], bool]:
-    """Return (ids whose body contains *body_text*, incomplete).
+    deadline: float,
+) -> Tuple[Dict[str, str], bool]:
+    """Return ({id: body} of messages whose body contains *body_text*, incomplete).
 
     Mail only lists candidate ids (one Apple Event per mailbox, with every
     non-body filter in the whose clause); the bodies are read from disk by
     emlx.py, so Mail never renders message content. Stops after *wanted*
-    matches or BODY_SEARCH_BUDGET_S seconds.
+    matches, or incomplete when the listing, the body reads or their source
+    fallbacks reach *deadline* minus BODY_SEARCH_FETCH_RESERVE_S.
     """
+    read_until = deadline - BODY_SEARCH_FETCH_RESERVE_S
+    timeout = int(read_until - time.monotonic())
+    if timeout < 1:
+        return {}, True
+
     script = f'''
     tell application "Mail"
-        with timeout of 180 seconds
+        with timeout of {timeout} seconds
             try
                 set outLines to {{}}
                 {date_setup}
@@ -556,7 +593,7 @@ def _body_search_ids(
                             if not shouldSkip then
                                 set idList to {id_selection}
                                 set AppleScript's text item delimiters to ","
-                                set end of outLines to accountName & "|||" & mailboxName & "|||" & (idList as string)
+                                set end of outLines to accountName & {AS_FIELD_SEP} & mailboxName & {AS_FIELD_SEP} & (idList as string)
                                 set AppleScript's text item delimiters to ""
                             end if
                         on error
@@ -564,25 +601,29 @@ def _body_search_ids(
                         end try
                     end repeat
                 end repeat
-                set AppleScript's text item delimiters to linefeed
+                set AppleScript's text item delimiters to {AS_RECORD_SEP}
                 set outputText to outLines as string
                 set AppleScript's text item delimiters to ""
                 return outputText
             on error errMsg
-                return "ERROR|||" & errMsg
+                return "ERROR" & {AS_FIELD_SEP} & errMsg
             end try
         end timeout
     end tell
     '''
-    result = run_applescript(script, timeout=180)
-    if result.startswith("ERROR|||"):
-        raise ValueError(result.split("|||", 1)[1])
+    try:
+        result = run_applescript(script, timeout=timeout)
+    except Exception as exc:
+        if _timed_out(exc, read_until):
+            return {}, True
+        raise
+    if result.startswith("ERROR" + FIELD_SEP):
+        raise ValueError(result.split(FIELD_SEP, 1)[1])
 
     needle = body_text.lower()
-    started = time.monotonic()
-    matches: List[str] = []
-    for line in result.splitlines():
-        parts = line.split("|||")
+    matches: Dict[str, str] = {}
+    for line in result.split(RECORD_SEP):
+        parts = line.split(FIELD_SEP)
         if len(parts) != 3:
             continue
         account_name, mailbox_name, id_text = parts
@@ -591,17 +632,20 @@ def _body_search_ids(
                 continue
             if len(matches) >= wanted:
                 return matches, False
-            if time.monotonic() - started > BODY_SEARCH_BUDGET_S:
+            remaining = int(read_until - time.monotonic())
+            if remaining < 1:
                 return matches, True
-            message = get_message(message_id, account_name, mailbox_name)
+            message = get_message(message_id, account_name, mailbox_name, timeout=remaining)
             if message is None:
+                if time.monotonic() >= read_until:
+                    return matches, True  # the source fallback ran out of time
                 continue
             if has_attachments is not None:
                 if bool(list(message.iter_attachments())) != has_attachments:
                     continue
             text = message_body_text(message)
             if text is not None and needle in text.lower():
-                matches.append(message_id)
+                matches[message_id] = text
     return matches, False
 
 
@@ -729,6 +773,7 @@ def get_email_thread(
     for prefix in thread_keywords:
         cleaned_keyword = cleaned_keyword.replace(prefix, "").strip()
     escaped_keyword = escape_applescript(cleaned_keyword)
+    nonce = new_body_nonce()
 
     mailbox_script = f'''
         try
@@ -823,7 +868,7 @@ def get_email_thread(
                     set outputText to outputText & "   Date: " & (messageDate as string) & return
 
                     -- Body preview: filled in from disk after the script (emlx.py)
-                    set outputText to outputText & "   Preview: " & {body_token_script("aMessage", '"' + escaped_account + '"', '"' + escaped_mailbox + '"')} & return
+                    set outputText to outputText & "   Preview: " & {body_token_script(nonce, "aMessage", '"' + escaped_account + '"', '"' + escaped_mailbox + '"')} & return
 
                     set outputText to outputText & return
                 end try
@@ -838,4 +883,4 @@ def get_email_thread(
     '''
 
     result = run_applescript(script)
-    return fill_body_tokens(result, 150, missing=None)
+    return fill_body_tokens(result, 150, nonce, missing=None)

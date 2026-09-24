@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
-from apple_mail_mcp.emlx import fill_body_tokens
+from apple_mail_mcp.emlx import fill_body_tokens, new_body_nonce
 from apple_mail_mcp.core import (
     inject_preferences,
     escape_applescript,
@@ -127,6 +127,7 @@ def list_inbox_emails(
     account_filter = f'if accountName is "{escaped_account}" then' if account else ""
     account_filter_end = "end if" if account else ""
     inbox_setup, fields = _inbox_messages_script(max_emails, include_read)
+    nonce = new_body_nonce()
 
     script = f"""
     tell application "Mail"
@@ -180,7 +181,7 @@ def list_inbox_emails(
                                     set outputText to outputText & "   Link: message://%3C" & cleanMid & "%3E" & return
                                 end if
 
-                                {content_preview_script(200) if include_content else ""}
+                                {content_preview_script(200, nonce) if include_content else ""}
 
                                 set outputText to outputText & return
 
@@ -206,7 +207,7 @@ def list_inbox_emails(
 
     result = run_applescript(script)
     if include_content:
-        result = fill_body_tokens(result, 200, missing="[Not available]")
+        result = fill_body_tokens(result, 200, nonce, missing="[Not available]")
     return result
 
 

@@ -4,7 +4,16 @@ import os
 from typing import Optional, List, Dict, Any
 
 from apple_mail_mcp.server import mcp
-from apple_mail_mcp.core import inject_preferences, escape_applescript, run_applescript, inbox_mailbox_script
+from apple_mail_mcp.core import (
+    AS_FIELD_SEP,
+    AS_RECORD_SEP,
+    FIELD_SEP,
+    RECORD_SEP,
+    inject_preferences,
+    escape_applescript,
+    run_applescript,
+    inbox_mailbox_script,
+)
 from apple_mail_mcp.constants import SKIP_FOLDERS
 from apple_mail_mcp.emlx import get_message_body, preview
 
@@ -502,7 +511,8 @@ def export_emails(
 
                 if foundMessage is not missing value then
                     -- The body is read from disk and the file written in Python
-                    return "FOUND|||" & ((id of foundMessage) as string) & "|||" & (subject of foundMessage) & "|||" & (sender of foundMessage) & "|||" & ((date received of foundMessage) as string)
+                    set fs to {AS_FIELD_SEP}
+                    return "FOUND" & fs & ((id of foundMessage) as string) & fs & (subject of foundMessage) & fs & (sender of foundMessage) & fs & ((date received of foundMessage) as string)
                 else
                     set outputText to outputText & "⚠ No email found matching: {safe_subject_keyword}" & return
                 end if
@@ -537,7 +547,8 @@ def export_emails(
                 set messageCount to count of mailboxMessages
 
                 -- Bodies are read from disk and files written in Python
-                set outputText to "COUNT|||" & messageCount
+                set fs to {AS_FIELD_SEP}
+                set outputText to "COUNT" & fs & messageCount
                 set exportCount to 0
                 repeat with aMessage in mailboxMessages
                     if exportCount >= {max_emails} then exit repeat
@@ -545,7 +556,7 @@ def export_emails(
                         set messageSubject to subject of aMessage
                         set messageSender to sender of aMessage
                         set messageDate to date received of aMessage
-                        set outputText to outputText & return & "ENTRY|||" & ((id of aMessage) as string) & "|||" & messageSubject & "|||" & messageSender & "|||" & (messageDate as string)
+                        set outputText to outputText & {AS_RECORD_SEP} & "ENTRY" & fs & ((id of aMessage) as string) & fs & messageSubject & fs & messageSender & fs & (messageDate as string)
                         set exportCount to exportCount + 1
                     end try
                 end repeat
@@ -583,14 +594,15 @@ def _export_document(subject: str, sender: str, date: str, body: str, format: st
 
 
 def _parse_export_entry(line: str):
-    parts = line.split("|||")
+    """(id, subject, sender, date) of a FIELD_SEP-separated FOUND/ENTRY record."""
+    parts = line.split(FIELD_SEP)
     if len(parts) < 5:
         return None
-    return parts[1], parts[2], parts[3], "|||".join(parts[4:])
+    return parts[1], parts[2], parts[3], FIELD_SEP.join(parts[4:])
 
 
 def _write_single_export(result, account, mailbox, save_dir, format):
-    entry = _parse_export_entry(result) if result.startswith("FOUND|||") else None
+    entry = _parse_export_entry(result) if result.startswith("FOUND" + FIELD_SEP) else None
     if entry is None:
         return result
     message_id, subject, sender, date = entry
@@ -607,13 +619,13 @@ def _write_single_export(result, account, mailbox, save_dir, format):
 
 
 def _write_mailbox_export(result, account, mailbox, save_dir, format, max_emails):
-    lines = result.split("\n")
-    message_count = int(lines[0].split("|||", 1)[1]) if lines[0].startswith("COUNT|||") else 0
+    lines = result.split(RECORD_SEP)
+    message_count = int(lines[0].split(FIELD_SEP, 1)[1]) if lines[0].startswith("COUNT" + FIELD_SEP) else 0
     export_dir = f"{save_dir}/{mailbox}_export"
     os.makedirs(export_dir, exist_ok=True)
     export_count = 0
     for line in lines[1:]:
-        entry = _parse_export_entry(line) if line.startswith("ENTRY|||") else None
+        entry = _parse_export_entry(line) if line.startswith("ENTRY" + FIELD_SEP) else None
         if entry is None:
             continue
         message_id, subject, sender, date = entry
@@ -682,8 +694,9 @@ def _get_recent_emails_structured(
                         -- Preview is read from disk in Python (emlx.py); pass the id
                         set messagePreview to (id of aMessage) as string
 
-                        -- Format as parseable string: SUBJECT|||SENDER|||DATE|||READ|||ACCOUNT|||PREVIEW
-                        set emailRecord to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName & "|||" & messagePreview
+                        -- Fields SUBJECT SENDER DATE READ ACCOUNT PREVIEW, separated by the unit separator
+                        set fs to {AS_FIELD_SEP}
+                        set emailRecord to messageSubject & fs & messageSender & fs & (messageDate as string) & fs & messageRead & fs & accountName & fs & messagePreview
                         set end of allEmails to emailRecord
                         set emailCount to emailCount + 1
                     end try
@@ -691,8 +704,8 @@ def _get_recent_emails_structured(
             end try
         end repeat
 
-        -- Join all emails with newline
-        set AppleScript's text item delimiters to linefeed
+        -- Join all emails with the record separator
+        set AppleScript's text item delimiters to {AS_RECORD_SEP}
         set emailOutput to allEmails as string
         set AppleScript's text item delimiters to ""
         return emailOutput
@@ -704,10 +717,9 @@ def _get_recent_emails_structured(
     # Parse the result into structured data
     emails = []
     if result:
-        for line in result.split('\n'):
-            if '|||' in line:
-                # Use maxsplit=5 so preview field (last) can contain '|||'
-                parts = line.split('|||', 5)
+        for line in result.split(RECORD_SEP):
+            if FIELD_SEP in line:
+                parts = line.split(FIELD_SEP, 5)
                 if len(parts) >= 5:
                     emails.append({
                         'subject': parts[0].strip(),

@@ -4,6 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+from apple_mail_mcp.core import FIELD_SEP, RECORD_SEP
 from apple_mail_mcp.tools import manage as manage_tools
 from apple_mail_mcp.tools import search as search_tools
 from apple_mail_mcp.tools import smart_inbox as smart_inbox_tools
@@ -21,7 +22,7 @@ def _record_line(
     flag_index=-1,
     content_preview="",
 ):
-    return "|||".join(
+    return FIELD_SEP.join(
         [
             str(message_id),
             internet_message_id,
@@ -43,7 +44,7 @@ class SearchToolTests(unittest.TestCase):
 
         def fake_run(script, timeout=120):
             captured["script"] = script
-            return "\n".join(
+            return RECORD_SEP.join(
                 [
                     _record_line(
                         100,
@@ -284,11 +285,11 @@ class SearchToolTests(unittest.TestCase):
         def fake_run(script, timeout=120):
             scripts.append(script)
             if len(scripts) == 1:
-                return "Work|||INBOX|||100,101,102"
+                return FIELD_SEP.join(["Work", "INBOX", "100,101,102"])
             return _record_line(101, "Receipt")
 
         with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
-                patch("apple_mail_mcp.tools.search.get_message", side_effect=lambda i, a, m: make(bodies[i])):
+                patch("apple_mail_mcp.tools.search.get_message", side_effect=lambda i, a, m, timeout: make(bodies[i])):
             response = json.loads(
                 search_tools.search_emails(
                     account="Work", body_text="invoice", output_format="json", limit=1
@@ -326,7 +327,7 @@ class SearchToolTests(unittest.TestCase):
         message.set_content("invoice")
 
         def fake_run(script, timeout=120):
-            return "Work|||INBOX|||100,101"
+            return FIELD_SEP.join(["Work", "INBOX", "100,101"])
 
         with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
                 patch("apple_mail_mcp.tools.search.get_message", return_value=message), \
@@ -361,7 +362,7 @@ class SearchToolTests(unittest.TestCase):
 
     def test_search_emails_reports_flag_color(self):
         def fake_run(script, timeout=120):
-            return "\n".join(
+            return RECORD_SEP.join(
                 [
                     _record_line(100, "Flagged orange", flag_index=1),
                     _record_line(101, "Not flagged", flag_index=-1),
@@ -565,18 +566,18 @@ class SmartInboxToolTests(unittest.TestCase):
         self.assertNotIn("content of", captured["script"])
 
     def test_get_needs_response_ranks_with_bodies_from_disk(self):
-        output = "\n".join(
-            [
-                "EMAILS NEEDING RESPONSE",
-                "Account: Work | Mailbox: INBOX | Last 7 days",
-                "========================================",
-                "",
-                "ENTRY|||1|||Plain note|||a@example.com|||Mon|||",
-                "ENTRY|||2|||Budget|||b@example.com|||Tue|||flagged red",
-                "ENTRY|||3|||Lunch?|||c@example.com|||Wed|||",
-                "ENTRY|||4|||Hello|||d@example.com|||Thu|||",
-            ]
+        header = (
+            "EMAILS NEEDING RESPONSE\n"
+            "Account: Work | Mailbox: INBOX | Last 7 days\n"
+            "========================================\n\n"
         )
+        entries = [
+            ["1", "Plain note", "a@example.com", "Mon", ""],
+            ["2", "Budget", "b@example.com", "Tue", "flagged red"],
+            ["3", "Lunch?", "c@example.com", "Wed", ""],
+            ["4", "Hello", "d@example.com", "Thu", ""],
+        ]
+        output = RECORD_SEP.join([header] + [FIELD_SEP.join(["ENTRY"] + e) for e in entries])
         bodies = {"1": "fyi", "2": "Can you check this?", "4": "x" * 600 + "?"}
 
         with patch("apple_mail_mcp.tools.smart_inbox.run_applescript", return_value=output), \
@@ -598,6 +599,258 @@ class SmartInboxToolTests(unittest.TestCase):
             "========================================\n"
             "Found 4 email(s) needing response.",
         )
+
+
+class _Clock:
+    """Stand-in for the time module: monotonic() returns a settable value."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def monotonic(self):
+        return self.t
+
+
+def _message(body):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message.set_content(body)
+    return message
+
+
+class SeparatorTests(unittest.TestCase):
+    """Records use the ASCII unit/record separators, so '|||' in a name is data."""
+
+    def test_search_records_keep_pipes_in_subject_and_mailbox(self):
+        output = RECORD_SEP.join(
+            [
+                _record_line(100, "A ||| B", mailbox="Clients|||2026"),
+                _record_line(101, "Second\nline?", mailbox="INBOX"),
+            ]
+        )
+        records = search_tools._parse_search_records(output)
+        self.assertEqual([r["subject"] for r in records], ["A ||| B", "Second\nline?"])
+        self.assertEqual(records[0]["mailbox"], "Clients|||2026")
+        self.assertEqual(records[0]["account"], "Work")
+
+    def test_search_script_emits_separators(self):
+        scripts = []
+
+        def fake_run(script, timeout=120):
+            scripts.append(script)
+            return ""
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
+            search_tools.search_emails(account="Work", body_text="x")
+            search_tools.search_emails(account="Work", subject_keyword="x")
+
+        for script in scripts:
+            self.assertNotIn("|||", script)
+            self.assertIn("(character id 31)", script)
+            self.assertIn("(character id 30)", script)
+
+    def test_body_search_handles_pipes_in_mailbox_name(self):
+        scripts = []
+
+        def fake_run(script, timeout=120):
+            scripts.append(script)
+            if len(scripts) == 1:
+                return FIELD_SEP.join(["Work", "Clients|||2026", "100"])
+            return _record_line(100, "Hit ||| here", mailbox="Clients|||2026")
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
+                patch("apple_mail_mcp.tools.search.get_message",
+                      side_effect=lambda i, a, m, timeout: _message("an invoice")) as get:
+            payload = json.loads(
+                search_tools.search_emails(account="Work", body_text="invoice", output_format="json")
+            )
+
+        self.assertEqual(get.call_args.args[:3], ("100", "Work", "Clients|||2026"))
+        self.assertEqual(payload["items"][0]["subject"], "Hit ||| here")
+        self.assertEqual(payload["items"][0]["mailbox"], "Clients|||2026")
+
+    def test_export_entries_keep_pipes_in_subject(self):
+        from apple_mail_mcp.tools import analytics as analytics_tools
+        import tempfile
+
+        output = RECORD_SEP.join(
+            [
+                FIELD_SEP.join(["COUNT", "2"]),
+                FIELD_SEP.join(["ENTRY", "1", "Q3 ||| budget", "a@example.com", "Mon"]),
+                FIELD_SEP.join(["ENTRY", "2", "Second", "b@example.com", "Tue"]),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("apple_mail_mcp.tools.analytics.get_message_body", side_effect=lambda i, a, m: f"body {i}"):
+            report = analytics_tools._write_mailbox_export(output, "Work", "INBOX", tmp, "txt", 10)
+            import os
+            files = sorted(os.listdir(f"{tmp}/INBOX_export"))
+            with open(f"{tmp}/INBOX_export/1_Q3 ||| budget.txt", encoding="utf-8", newline="") as handle:
+                first = handle.read()
+
+        self.assertIn("Exported: 2", report)
+        self.assertEqual(files, ["1_Q3 ||| budget.txt", "2_Second.txt"])
+        self.assertEqual(first, "Subject: Q3 ||| budget\rFrom: a@example.com\rDate: Mon\r\rbody 1")
+
+        single = FIELD_SEP.join(["FOUND", "7", "A ||| B", "c@example.com", "Wed"])
+        self.assertEqual(
+            analytics_tools._parse_export_entry(single), ("7", "A ||| B", "c@example.com", "Wed")
+        )
+
+    def test_recent_emails_keep_pipes_in_subject(self):
+        from apple_mail_mcp.tools import analytics as analytics_tools
+
+        output = RECORD_SEP.join(
+            [
+                FIELD_SEP.join(["A ||| B", "a@example.com", "Mon", "false", "Work", "5"]),
+                FIELD_SEP.join(["Plain", "b@example.com", "Tue", "true", "Work", "6"]),
+            ]
+        )
+        with patch("apple_mail_mcp.tools.analytics.run_applescript", return_value=output) as run, \
+                patch("apple_mail_mcp.tools.analytics.get_message_body", side_effect=lambda i, a, m: f"body {i}"):
+            emails = analytics_tools._get_recent_emails_structured()
+
+        self.assertNotIn("|||", run.call_args.args[0])
+        self.assertEqual([e["subject"] for e in emails], ["A ||| B", "Plain"])
+        self.assertEqual([e["preview"] for e in emails], ["body 5", "body 6"])
+        self.assertEqual(emails[0]["account"], "Work")
+
+    def test_needs_response_keeps_pipes_in_subject(self):
+        header = "EMAILS NEEDING RESPONSE\n========================================\n\n"
+        output = RECORD_SEP.join(
+            [header, FIELD_SEP.join(["ENTRY", "1", "Q3 ||| budget?", "a@example.com", "Mon", ""])]
+        )
+        with patch("apple_mail_mcp.tools.smart_inbox.run_applescript", return_value=output) as run:
+            result = smart_inbox_tools.get_needs_response(account="Work")
+        self.assertNotIn("|||", run.call_args.args[0])
+        self.assertIn("1. [MEDIUM (contains question)] Q3 ||| budget?\n   From: a@example.com", result)
+
+    def test_run_applescript_passes_separators_through(self):
+        from apple_mail_mcp import core
+
+        class Proc:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return ("a\x1fb\x1f\x1ec\x1f\x01\r\n".encode(), b"")
+
+            def kill(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def poll(self):
+                return 0
+
+        with patch.object(core, "_popen_factory", return_value=Proc()):
+            # The trailing empty field survives; other control characters do not.
+            self.assertEqual(core.run_applescript("x"), "a\x1fb\x1f\x1ec\x1f")
+
+
+class BodySearchDeadlineTests(unittest.TestCase):
+    """One budget covers listing, body reads, source fallbacks and the metadata fetch."""
+
+    def _search(self, fake_run, get_message, clock):
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
+                patch("apple_mail_mcp.tools.search.get_message", side_effect=get_message), \
+                patch.object(search_tools, "time", clock):
+            return json.loads(
+                search_tools.search_emails(account="Work", body_text="invoice", output_format="json")
+            )
+
+    def test_fallback_timeouts_follow_the_remaining_budget(self):
+        clock = _Clock()
+        timeouts = []
+        budget = search_tools.BODY_SEARCH_BUDGET_S
+        reserve = search_tools.BODY_SEARCH_FETCH_RESERVE_S
+
+        def fake_run(script, timeout=120):
+            timeouts.append(("script", timeout))
+            if len(timeouts) == 1:
+                return FIELD_SEP.join(["Work", "INBOX", "100,101,102"])
+            return _record_line(100, "Hit")
+
+        def get_message(i, a, m, timeout):
+            timeouts.append((i, timeout))
+            clock.t += (budget - reserve) / 2  # a slow source fallback
+            return _message("invoice")
+
+        payload = self._search(fake_run, get_message, clock)
+
+        self.assertEqual(
+            timeouts,
+            [
+                ("script", budget - reserve),
+                ("100", budget - reserve),
+                ("101", (budget - reserve) // 2),
+                ("script", reserve),  # the metadata fetch gets what is left
+            ],
+        )
+        self.assertTrue(payload["incomplete"])
+        self.assertEqual([item["message_id"] for item in payload["items"]], ["100"])
+
+    def test_metadata_fetch_timeout_reports_incomplete(self):
+        clock = _Clock()
+
+        def fake_run(script, timeout=120):
+            if "set idList to" in script:
+                return FIELD_SEP.join(["Work", "INBOX", "100"])
+            clock.t += timeout
+            raise Exception(f"AppleScript execution timed out after {timeout}s")
+
+        payload = self._search(fake_run, lambda i, a, m, timeout: _message("invoice"), clock)
+        self.assertTrue(payload["incomplete"])
+        self.assertEqual(payload["returned"], 0)
+
+    def test_listing_timeout_reports_incomplete(self):
+        def fake_run(script, timeout=120):
+            raise Exception(f"AppleScript execution timed out after {timeout}s")
+
+        payload = self._search(fake_run, lambda i, a, m, timeout: None, _Clock())
+        self.assertTrue(payload["incomplete"])
+        self.assertEqual(payload["returned"], 0)
+
+    def test_last_fallback_running_out_of_time_reports_incomplete(self):
+        clock = _Clock()
+        budget = search_tools.BODY_SEARCH_BUDGET_S
+
+        def fake_run(script, timeout=120):
+            return FIELD_SEP.join(["Work", "INBOX", "100"])
+
+        def get_message(i, a, m, timeout):
+            clock.t += budget  # the fallback used the whole budget and gave up
+            return None
+
+        payload = self._search(fake_run, get_message, clock)
+        self.assertTrue(payload["incomplete"])
+
+    def test_other_errors_still_raise(self):
+        def fake_run(script, timeout=120):
+            raise Exception("AppleScript error: Mail got an error")
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
+            with self.assertRaises(Exception):
+                search_tools.search_emails(account="Work", body_text="invoice")
+
+    def test_include_content_reuses_bodies_read_during_the_search(self):
+        def fake_run(script, timeout=120):
+            if "set idList to" in script:
+                return FIELD_SEP.join(["Work", "INBOX", "100"])
+            return _record_line(100, "Hit")
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
+                patch("apple_mail_mcp.tools.search.get_message",
+                      side_effect=lambda i, a, m, timeout: _message("the invoice text")), \
+                patch("apple_mail_mcp.tools.search.get_message_body") as body:
+            payload = json.loads(
+                search_tools.search_emails(
+                    account="Work", body_text="invoice", include_content=True, output_format="json"
+                )
+            )
+        body.assert_not_called()
+        self.assertEqual(payload["items"][0]["content_preview"], "the invoice text")
 
 
 if __name__ == "__main__":

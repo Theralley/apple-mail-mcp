@@ -4,6 +4,10 @@ from typing import Optional
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
+    AS_FIELD_SEP,
+    AS_RECORD_SEP,
+    FIELD_SEP,
+    RECORD_SEP,
     inject_preferences,
     escape_applescript,
     read_flag_index_script,
@@ -381,15 +385,17 @@ def get_needs_response(
                                     end if
                                 end if
 
-                                set end of candidateEntries to "ENTRY|||" & ((id of aMessage) as string) & "|||" & messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & flagLabel
+                                set fs to {AS_FIELD_SEP}
+                                set end of candidateEntries to "ENTRY" & fs & ((id of aMessage) as string) & fs & messageSubject & fs & messageSender & fs & (messageDate as string) & fs & flagLabel
                             end if
                         end if
                     end if
                 end try
             end repeat
 
-            set AppleScript's text item delimiters to return
-            set outputText to outputText & (candidateEntries as string)
+            -- One record per candidate, after the header
+            set AppleScript's text item delimiters to {AS_RECORD_SEP}
+            set outputText to outputText & {AS_RECORD_SEP} & (candidateEntries as string)
             set AppleScript's text item delimiters to ""
 
         on error errMsg
@@ -418,15 +424,15 @@ def _format_needs_response(result: str, account: str, mailbox: str) -> str:
     """
     header = []
     high, normal = [], []
-    for line in result.split("\n"):
-        if not line.startswith("ENTRY|||"):
+    for line in result.split(RECORD_SEP):
+        if not line.startswith("ENTRY" + FIELD_SEP):
             header.append(line)
             continue
-        parts = line.split("|||")
-        if len(parts) < 6:
+        parts = line.split(FIELD_SEP)
+        if len(parts) < 5:
             continue
         message_id, subject, sender, date = parts[1], parts[2], parts[3], parts[4]
-        flag_label = "|||".join(parts[5:])
+        flag_label = FIELD_SEP.join(parts[5:]).strip()
         has_question = "?" in subject
         if not has_question:
             body = get_message_body(message_id, account, mailbox)

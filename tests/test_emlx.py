@@ -70,9 +70,11 @@ def mail_store(tmp_path, monkeypatch):
     monkeypatch.setattr(emlx, "MAIL_DIR", tmp_path)
     monkeypatch.setattr(emlx, "_data_dirs", None)
     monkeypatch.setattr(emlx, "_path_cache", {})
+    monkeypatch.setattr(emlx, "_last_scan", 0.0)
     inbox = tmp_path / "V10" / "ACCT-1" / "INBOX.mbox" / "UUID-A" / "Data"
     gmail = tmp_path / "V10" / "ACCT-2" / "[Gmail].mbox" / "All e-post.mbox" / "UUID-B" / "Data"
     (tmp_path / "V10" / "MailData").mkdir(parents=True)
+    (tmp_path / "V10" / "MailData" / "Envelope Index").write_bytes(b"")
 
     def put(data_dir, message_id, raw, partial=False):
         folder = data_dir / emlx.message_subpath(message_id)
@@ -139,7 +141,7 @@ def test_html_drops_script_and_style(mail_store):
 def test_partial_without_body_falls_back_to_source(mail_store):
     with patch.object(emlx, "_source_via_applescript", return_value=PLAIN.decode()) as fallback:
         body = emlx.get_message_body(52105, "Work", "INBOX")
-    fallback.assert_called_once_with(52105, "Work", "INBOX")
+    fallback.assert_called_once_with(52105, "Work", "INBOX", 60)
     assert body == "Hej, fungerar det?\nRad två"
 
 
@@ -168,14 +170,14 @@ def test_fill_body_tokens(mail_store):
     text = "\n".join(
         [
             "✉ Subject",
-            "   Content: ⟦body:51|Work|INBOX⟧",
-            "   Content: ⟦body:888888|Work|INBOX⟧",
+            "   Content: ⟦body:n0nce:51|Work|INBOX⟧",
+            "   Content: ⟦body:n0nce:888888|Work|INBOX⟧",
             "tail",
         ]
     )
     with patch.object(emlx, "_source_via_applescript", return_value=None):
-        filled = emlx.fill_body_tokens(text, 10, missing="[Not available]")
-        dropped = emlx.fill_body_tokens(text, 10, missing=None)
+        filled = emlx.fill_body_tokens(text, 10, "n0nce", missing="[Not available]")
+        dropped = emlx.fill_body_tokens(text, 10, "n0nce", missing=None)
     assert filled.split("\n") == ["✉ Subject", "   Content: Hej, funge...", "   Content: [Not available]", "tail"]
     assert dropped.split("\n") == ["✉ Subject", "   Content: Hej, funge...", "tail"]
 
@@ -207,3 +209,167 @@ def test_content_grep_would_catch_the_old_pattern():
     assert pattern.search("set msgContent to content of aMessage")
     assert pattern.search("set msgContent to content of {message_var}")
     assert not pattern.search("never requests ``content of <message>``")
+
+
+# ---------------------------------------------------------------------------
+# Regressions from review
+# ---------------------------------------------------------------------------
+
+
+def _put(data_dir, message_id, raw, emlx_bytes=None):
+    folder = data_dir / emlx.message_subpath(message_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{message_id}.emlx").write_bytes(emlx_bytes if emlx_bytes is not None else _emlx_bytes(raw))
+
+
+def test_only_the_live_store_is_searched(mail_store):
+    """An id from an older store (V9) is a different message and never returned."""
+    old = mail_store / "V9" / "ACCT-1" / "INBOX.mbox" / "UUID-OLD" / "Data"
+    (mail_store / "V9" / "MailData").mkdir(parents=True)
+    (mail_store / "V9" / "MailData" / "Envelope Index").write_bytes(b"")
+    _put(old, 777, PLAIN)
+    _put(old, 51, LATIN1)
+    # A newer directory without an Envelope Index is not Mail's store either.
+    stray = mail_store / "V11" / "ACCT-1" / "INBOX.mbox" / "UUID-NEW" / "Data"
+    _put(stray, 778, PLAIN)
+
+    assert emlx.find_message_file(777) is None
+    assert emlx.find_message_file(778) is None
+    assert emlx.find_message_file(51).relative_to(mail_store).parts[0] == "V10"
+    with patch.object(emlx, "_source_via_applescript", return_value=None):
+        assert emlx.get_message_body(51) == "Hej, fungerar det?\nRad två"
+        assert emlx.get_message_body(777) is None
+
+
+def test_no_store_with_envelope_index_finds_nothing(mail_store):
+    (mail_store / "V10" / "MailData" / "Envelope Index").unlink()
+    assert emlx.find_message_file(51) is None
+
+
+MIXED_TEXT_ATTACHMENT_TEXT = _raw(
+    'Subject: Mixed\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary="x1"\n',
+    b"--x1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBefore the file.\r\n"
+    b"--x1\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=notes.txt\r\n\r\n"
+    b"ATTACHED NOTES\r\n"
+    b"--x1\r\nContent-Type: text/plain; name=log.txt\r\n\r\nNAMED LOG\r\n"
+    b"--x1\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=a.pdf\r\n\r\n%PDF\r\n"
+    b"--x1\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Disposition: inline\r\n\r\nAfter the file.\r\n"
+    b"--x1--\r\n",
+)
+MIXED_ALTERNATIVE_THEN_TEXT = _raw(
+    'Subject: Mixed alt\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary="y1"\n',
+    b'--y1\r\nContent-Type: multipart/alternative; boundary="y2"\r\n\r\n'
+    b"--y2\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nplain first\r\n"
+    b"--y2\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>html first</p>\r\n--y2--\r\n"
+    b"--y1\r\nContent-Type: image/png\r\nContent-Disposition: attachment; filename=a.png\r\n\r\nPNG\r\n"
+    b"--y1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nplain second\r\n"
+    b"--y1--\r\n",
+)
+MIXED_HTML_ONLY = _raw(
+    'Subject: Html parts\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary="z1"\n',
+    b"--z1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>one</p>\r\n"
+    b"--z1\r\nContent-Type: text/html; charset=utf-8\r\nContent-Disposition: attachment; filename=page.html\r\n\r\n<p>FILE</p>\r\n"
+    b"--z1\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>two</p>\r\n"
+    b"--z1--\r\n",
+)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (MIXED_TEXT_ATTACHMENT_TEXT, "Before the file.\nAfter the file."),
+        (MIXED_ALTERNATIVE_THEN_TEXT, "plain first\nplain second"),
+        (MIXED_HTML_ONLY, "one\ntwo"),
+    ],
+    ids=["text-attachment-text", "alternative-then-text", "html-parts-when-no-plain"],
+)
+def test_every_inline_text_part_in_order(raw, expected):
+    assert emlx.body_text(emlx.parse_rfc822(raw)) == expected
+
+
+UNKNOWN_CHARSET_UTF8 = _raw(
+    "Subject: Odd\nContent-Type: text/plain; charset=x-no-such-charset\n", "Grüße från Göteborg".encode("utf-8")
+)
+UNKNOWN_CHARSET_LATIN1 = _raw(
+    "Subject: Odd\nContent-Type: text/plain; charset=x-no-such-charset\n", "Återbetalning".encode("iso-8859-1")
+)
+UNKNOWN_CHARSET_HTML = _raw(
+    'Subject: Odd\nMIME-Version: 1.0\nContent-Type: multipart/alternative; boundary="u1"\n',
+    b"--u1\r\nContent-Type: text/html; charset=\"bogus'\"\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+    b"PHA+SGVsbG8gPGI+d29ybGQ8L2I+PC9wPg==\r\n--u1--\r\n",
+)
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (UNKNOWN_CHARSET_UTF8, "Grüße från Göteborg"),
+        (UNKNOWN_CHARSET_LATIN1, "Återbetalning"),
+        (UNKNOWN_CHARSET_HTML, "Hello world"),
+    ],
+    ids=["utf-8-bytes", "latin-1-bytes", "html-base64"],
+)
+def test_unknown_charset_never_fails(mail_store, raw, expected):
+    _put(mail_store / "V10" / "ACCT-1" / "INBOX.mbox" / "UUID-A" / "Data", 3001, raw)
+    with patch.object(emlx, "_source_via_applescript") as fallback:
+        assert emlx.get_message_body(3001) == expected
+    fallback.assert_not_called()
+
+
+def test_truncated_file_uses_source_fallback(mail_store):
+    """A file shorter than its declared byte count is still being written."""
+    inbox = mail_store / "V10" / "ACCT-1" / "INBOX.mbox" / "UUID-A" / "Data"
+    _put(inbox, 3002, None, emlx_bytes=f"{len(PLAIN) + 500}\n".encode() + PLAIN)
+    with pytest.raises(ValueError):
+        emlx.parse_emlx(emlx.find_message_file(3002).read_bytes())
+
+    assert emlx.get_message_body(3002, allow_fallback=False) is None
+    with patch.object(emlx, "_source_via_applescript", return_value=ALTERNATIVE.decode()) as fallback:
+        assert emlx.get_message_body(3002, "Work", "INBOX") == "plain version"
+    fallback.assert_called_once_with(3002, "Work", "INBOX", 60)
+
+
+def test_fill_body_tokens_ignores_tokens_without_the_nonce(mail_store):
+    """A subject that spells out a token must not pull in another message's body."""
+    nonce = emlx.new_body_nonce()
+    assert len(nonce) >= 32 and nonce != emlx.new_body_nonce()
+    text = "\n".join(
+        [
+            "✉ ⟦body:51|Work|INBOX⟧ and ⟦body:guess:51|Work|INBOX⟧",
+            f"   Content: ⟦body:{nonce}:999|Work|INBOX⟧",
+        ]
+    )
+    with patch.object(emlx, "_source_via_applescript", return_value=None):
+        filled = emlx.fill_body_tokens(text, 0, nonce, missing="[Not available]")
+    assert filled.split("\n") == [
+        "✉ ⟦body:51|Work|INBOX⟧ and ⟦body:guess:51|Work|INBOX⟧",
+        "   Content: First line  Second Third & more",
+    ]
+
+
+def test_body_token_script_carries_the_nonce():
+    script = emlx.body_token_script("abc123", "aMessage", "accountName", '"INBOX"')
+    assert script.startswith('"⟦body:abc123:" & ((id of aMessage) as string)')
+
+
+def test_missing_id_rescans_at_most_once_a_minute(mail_store, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(emlx.time, "monotonic", lambda: clock["t"])
+    scans = []
+    real_scan = emlx._scan_data_dirs
+    monkeypatch.setattr(emlx, "_scan_data_dirs", lambda: scans.append(clock["t"]) or real_scan())
+
+    assert emlx.find_message_file(424242) is None  # cold cache: one scan
+    assert scans == [1000.0]
+    clock["t"] += 10
+    assert emlx.find_message_file(424242) is None
+    assert emlx.find_message_file(424243) is None
+    assert scans == [1000.0]
+
+    new_box = mail_store / "V10" / "ACCT-3" / "New.mbox" / "UUID-C" / "Data"
+    _put(new_box, 424242, PLAIN)
+    clock["t"] += 51  # 61 s after the last scan
+    assert emlx.find_message_file(424242) is not None
+    assert scans == [1000.0, 1061.0]
+    assert emlx.find_message_file(424243) is None  # just scanned
+    assert scans == [1000.0, 1061.0]

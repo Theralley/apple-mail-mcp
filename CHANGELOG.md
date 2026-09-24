@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. A test fails if any AppleScript in the package reads `content of`. On a
   2,335-message inbox, a full `body_text` search went from 138 s (stopped
   incomplete) to 11 s (complete).
+  Details: only the live store (the newest `V<n>` with
+  `MailData/Envelope Index`) is read, because an id in an older store is a
+  different message; every inline text part is used in order, skipping
+  attachments; an unknown charset decodes as UTF-8 or Latin-1 instead of
+  failing; a file shorter than its declared length uses the source fallback;
+  a missing id rescans the store at most once a minute; body tokens carry a
+  per-call nonce, so a subject cannot pull in another message's body; and
+  one deadline covers a whole `body_text` search, fallbacks and metadata
+  fetch included. Structured script output in these paths separates fields
+  and records with the ASCII unit and record separators instead of `|||` and
+  line breaks.
 - **`--read-only` is now a strict allowlist:** read mail, save attachments,
   export to local files, sync, and create or list drafts; nothing else.
   Previously it only removed the three send tools, so moving, flagging,

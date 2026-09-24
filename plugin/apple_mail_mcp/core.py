@@ -157,6 +157,17 @@ def escape_applescript(value: str) -> str:
     )
 
 
+# Field and record separators for structured script output: ASCII unit and
+# record separator, which never occur in subjects, senders or mailbox names
+# (unlike "|||" or line breaks). Scripts emit them as AS_FIELD_SEP and
+# AS_RECORD_SEP; run_applescript passes them through. Split records with
+# str.split(RECORD_SEP), not splitlines(), which also splits on \x1e.
+FIELD_SEP = "\x1f"
+RECORD_SEP = "\x1e"
+AS_FIELD_SEP = "(character id 31)"
+AS_RECORD_SEP = "(character id 30)"
+
+
 def _sanitize_for_json(text: str) -> str:
     """Sanitize text for safe JSON serialization over MCP stdio transport.
 
@@ -165,8 +176,10 @@ def _sanitize_for_json(text: str) -> str:
     """
     # Normalize line endings first (AppleScript uses \r)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Strip control characters but keep \n, \t, and all printable Unicode
-    return "".join(ch for ch in text if ch in ("\n", "\t") or (ord(ch) >= 32))
+    # Strip control characters but keep \n, \t, the field/record separators
+    # and all printable Unicode
+    keep = ("\n", "\t", FIELD_SEP, RECORD_SEP)
+    return "".join(ch for ch in text if ch in keep or (ord(ch) >= 32))
 
 
 def run_applescript(script: str, timeout: int = 120) -> str:
@@ -233,7 +246,8 @@ def _run_applescript_unlocked(script: str, timeout: int) -> str:
         if stderr_text:
             raise Exception(f"AppleScript error: {stderr_text}")
 
-    output = stdout.decode("utf-8", errors="replace").strip()
+    # str.strip() would also eat a trailing separator (an empty last field)
+    output = re.sub(r"^[^\S\x1c-\x1f]+|[^\S\x1c-\x1f]+$", "", stdout.decode("utf-8", errors="replace"))
     return _sanitize_for_json(output)
 
 
@@ -411,6 +425,7 @@ def inbox_mailbox_script(
 
 def content_preview_script(
     max_length: int,
+    nonce: str,
     output_var: str = "outputText",
     account_expr: str = "accountName",
     mailbox_expr: str = '"INBOX"',
@@ -419,11 +434,12 @@ def content_preview_script(
 
     The body itself is never requested from Mail (see emlx.py); the caller
     passes the script output through ``emlx.fill_body_tokens(output,
-    max_length, missing="[Not available]")``.
+    max_length, nonce, missing="[Not available]")`` with the same *nonce*
+    (from ``emlx.new_body_nonce()``).
     """
     from apple_mail_mcp.emlx import body_token_script
 
-    token = body_token_script("aMessage", account_expr, mailbox_expr)
+    token = body_token_script(nonce, "aMessage", account_expr, mailbox_expr)
     return f"""
                             set {output_var} to {output_var} & "   Content: " & {token} & return"""
 
@@ -566,13 +582,15 @@ def build_email_fields_script(
     include_content: bool = False,
     max_content_length: int = 300,
     output_var: str = "outputText",
+    nonce: str = "",
 ) -> str:
     """Return AppleScript snippet that extracts common fields from an email.
 
     Sets local variables: messageSubject, messageSender, messageDate,
     messageRead.  With *include_content* it also appends a "Content:" line
     holding a body token; pass the output through
-    ``emlx.fill_body_tokens(output, max_content_length, "[Not available]")``.
+    ``emlx.fill_body_tokens(output, max_content_length, nonce,
+    "[Not available]")`` with the same *nonce* (from ``emlx.new_body_nonce()``).
     """
     fields = f"""set messageSubject to subject of {message_var}
                                 set messageSender to sender of {message_var}
@@ -582,8 +600,11 @@ def build_email_fields_script(
     if not include_content:
         return fields
 
+    if not nonce:
+        raise ValueError("include_content needs the nonce passed to fill_body_tokens")
+
     from apple_mail_mcp.emlx import body_token_script
 
-    token = body_token_script(message_var)
+    token = body_token_script(nonce, message_var)
     return fields + f"""
                                 set {output_var} to {output_var} & "   Content: " & {token} & return"""
