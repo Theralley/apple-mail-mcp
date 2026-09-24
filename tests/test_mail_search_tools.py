@@ -243,24 +243,121 @@ class SearchToolTests(unittest.TestCase):
 
         self.assertIn("set searchAccounts to every account", captured["script"])
 
-    def test_search_emails_body_text_uses_lowercase_handler(self):
-        """When body_text is provided, the script should include LOWERCASE_HANDLER."""
-        captured = {}
+    def test_search_emails_body_search_never_asks_mail_for_content(self):
+        scripts = []
 
         def fake_run(script, timeout=120):
-            captured["script"] = script
+            scripts.append(script)
             return ""
 
         with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
             search_tools.search_emails(
                 account="Work",
                 body_text="invoice",
-                output_format="json",
-                limit=5,
+                sender="billing",
+                read_status="unread",
+                date_from="2026-01-01",
             )
 
-        self.assertIn("on lowercase(str)", captured["script"])
-        self.assertIn('lowerContent contains "invoice"', captured["script"])
+        # Mail only lists candidate ids, with every other filter in the whose clause.
+        self.assertEqual(len(scripts), 1)
+        self.assertIn(
+            'set idList to id of (every message of currentMailbox whose '
+            'sender contains "billing" and read status is false '
+            "and date received >= fromDate)",
+            scripts[0],
+        )
+        self.assertNotIn("content of", scripts[0])
+        self.assertNotIn("do shell script", scripts[0])
+
+    def test_search_emails_body_search_matches_bodies_from_disk(self):
+        from email.message import EmailMessage
+
+        def make(body):
+            message = EmailMessage()
+            message.set_content(body)
+            return message
+
+        bodies = {"100": "nothing here", "101": "Your INVOICE is ready", "102": "invoice again"}
+        scripts = []
+
+        def fake_run(script, timeout=120):
+            scripts.append(script)
+            if len(scripts) == 1:
+                return "Work|||INBOX|||100,101,102"
+            return _record_line(101, "Receipt")
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
+                patch("apple_mail_mcp.tools.search.get_message", side_effect=lambda i, a, m: make(bodies[i])):
+            response = json.loads(
+                search_tools.search_emails(
+                    account="Work", body_text="invoice", output_format="json", limit=1
+                )
+            )
+
+        # limit=1 needs limit + 1 matches: 101 and 102 (case-insensitive), not 100.
+        self.assertIn("(id is 101 or id is 102)", scripts[1])
+        self.assertNotIn("id is 100", scripts[1])
+        self.assertNotIn("content of", scripts[1])
+        self.assertEqual([item["message_id"] for item in response["items"]], ["101"])
+
+    def test_search_emails_flag_color_in_body_search_path(self):
+        scripts = []
+
+        def fake_run(script, timeout=120):
+            scripts.append(script)
+            return ""
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
+            search_tools.search_emails(
+                account="Work", body_text="invoice", flag_color="red"
+            )
+
+        self.assertIn(
+            "id of (every message of currentMailbox whose "
+            "(flagged status is true and flag index is 0))",
+            scripts[0],
+        )
+
+    def test_search_emails_body_search_reports_incomplete(self):
+        from email.message import EmailMessage
+
+        message = EmailMessage()
+        message.set_content("invoice")
+
+        def fake_run(script, timeout=120):
+            return "Work|||INBOX|||100,101"
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
+                patch("apple_mail_mcp.tools.search.get_message", return_value=message), \
+                patch.object(search_tools, "BODY_SEARCH_BUDGET_S", -1):
+            payload = json.loads(
+                search_tools.search_emails(
+                    account="Work", body_text="invoice", output_format="json"
+                )
+            )
+            text = search_tools.search_emails(account="Work", body_text="invoice")
+
+        self.assertEqual(payload["returned"], 0)
+        self.assertTrue(payload["incomplete"])
+        self.assertIn("results may be incomplete", payload["note"])
+        self.assertIn("results may be incomplete", text)
+
+    def test_search_emails_include_content_reads_preview_from_disk(self):
+        def fake_run(script, timeout=120):
+            self.assertNotIn("content of", script)
+            return _record_line(100, "Report", mailbox="INBOX", account="Work")
+
+        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run), \
+                patch("apple_mail_mcp.tools.search.get_message_body", return_value="Line one\nLine\ttwo ||| end") as body:
+            payload = json.loads(
+                search_tools.search_emails(
+                    account="Work", include_content=True, max_content_length=12, output_format="json"
+                )
+            )
+
+        body.assert_called_once_with("100", "Work", "INBOX")
+        self.assertEqual(payload["items"][0]["content_preview"], "Line one Lin...")
 
     def test_search_emails_reports_flag_color(self):
         def fake_run(script, timeout=120):
@@ -318,97 +415,6 @@ class SearchToolTests(unittest.TestCase):
 
         self.assertIn(
             "(flagged status is true and flag index is 5)", captured["script"]
-        )
-
-    def test_search_emails_flag_color_in_body_search_path(self):
-        captured = {}
-
-        def fake_run(script, timeout=120):
-            captured["script"] = script
-            return ""
-
-        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
-            search_tools.search_emails(
-                account="Work", body_text="invoice", flag_color="red"
-            )
-
-        # The flag filter is pushed into the whose clause that selects body
-        # candidates, so the flag index is only read when emitting records.
-        self.assertIn(
-            "set candidateMessages to every message of currentMailbox whose "
-            "(flagged status is true and flag index is 0)",
-            captured["script"],
-        )
-        self.assertEqual(
-            captured["script"].count("set messageFlagIndex to flag index of aMessage"),
-            1,
-        )
-
-    def test_search_emails_body_search_prefilters_with_whose_clause(self):
-        captured = {}
-
-        def fake_run(script, timeout=120):
-            captured["script"] = script
-            return ""
-
-        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
-            search_tools.search_emails(
-                account="Work",
-                body_text="invoice",
-                sender="billing",
-                read_status="unread",
-                date_from="2026-01-01",
-            )
-
-        self.assertIn(
-            'set candidateMessages to every message of currentMailbox whose '
-            'sender contains "billing" and read status is false '
-            "and date received >= fromDate",
-            captured["script"],
-        )
-        self.assertIn(
-            f"> {search_tools.BODY_SEARCH_BUDGET_S} then", captured["script"]
-        )
-        self.assertNotIn("do shell script", captured["script"])
-
-    def test_search_emails_body_search_reports_incomplete(self):
-        def fake_run(script, timeout=120):
-            return "\n".join(
-                [
-                    _record_line(100, "Invoice 100"),
-                    "INCOMPLETE|||body search time budget reached",
-                ]
-            )
-
-        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
-            payload = json.loads(
-                search_tools.search_emails(
-                    account="Work", body_text="invoice", output_format="json"
-                )
-            )
-            text = search_tools.search_emails(account="Work", body_text="invoice")
-
-        self.assertEqual(payload["returned"], 1)
-        self.assertTrue(payload["incomplete"])
-        self.assertIn("results may be incomplete", payload["note"])
-        self.assertIn("FOUND: 1 matching email(s)", text)
-        self.assertIn("results may be incomplete", text)
-
-    def test_search_emails_body_search_skips_flag_read_without_flag_filter(self):
-        captured = {}
-
-        def fake_run(script, timeout=120):
-            captured["script"] = script
-            return ""
-
-        with patch("apple_mail_mcp.tools.search.run_applescript", side_effect=fake_run):
-            search_tools.search_emails(account="Work", body_text="invoice")
-
-        # Only the record emission block reads flag index; the per-message
-        # scan loop must not pay for it when no flag filter is set.
-        self.assertEqual(
-            captured["script"].count("set messageFlagIndex to flag index of aMessage"),
-            1,
         )
 
     def test_search_emails_rejects_invalid_flag_color(self):
@@ -556,7 +562,42 @@ class SmartInboxToolTests(unittest.TestCase):
             'set flagColorNames to {"red", "orange", "yellow", "green", "blue", "purple", "gray"}',
             captured["script"],
         )
-        self.assertIn('"HIGH (" & flagLabel & " + question)"', captured["script"])
+        self.assertNotIn("content of", captured["script"])
+
+    def test_get_needs_response_ranks_with_bodies_from_disk(self):
+        output = "\n".join(
+            [
+                "EMAILS NEEDING RESPONSE",
+                "Account: Work | Mailbox: INBOX | Last 7 days",
+                "========================================",
+                "",
+                "ENTRY|||1|||Plain note|||a@example.com|||Mon|||",
+                "ENTRY|||2|||Budget|||b@example.com|||Tue|||flagged red",
+                "ENTRY|||3|||Lunch?|||c@example.com|||Wed|||",
+                "ENTRY|||4|||Hello|||d@example.com|||Thu|||",
+            ]
+        )
+        bodies = {"1": "fyi", "2": "Can you check this?", "4": "x" * 600 + "?"}
+
+        with patch("apple_mail_mcp.tools.smart_inbox.run_applescript", return_value=output), \
+                patch("apple_mail_mcp.tools.smart_inbox.get_message_body",
+                      side_effect=lambda i, a, m: bodies[i]) as body:
+            result = smart_inbox_tools.get_needs_response(account="Work")
+
+        # The subject already asks a question, so message 3's body is not read.
+        self.assertNotIn("3", [c.args[0] for c in body.call_args_list])
+        self.assertEqual(
+            result,
+            "EMAILS NEEDING RESPONSE\n"
+            "Account: Work | Mailbox: INBOX | Last 7 days\n"
+            "========================================\n\n"
+            "1. [HIGH (flagged red + question)] Budget\n   From: b@example.com\n   Date: Tue\n\n"
+            "2. [MEDIUM (contains question)] Lunch?\n   From: c@example.com\n   Date: Wed\n\n"
+            "3. [NORMAL] Plain note\n   From: a@example.com\n   Date: Mon\n\n"
+            "4. [NORMAL] Hello\n   From: d@example.com\n   Date: Thu\n\n"
+            "========================================\n"
+            "Found 4 email(s) needing response.",
+        )
 
 
 if __name__ == "__main__":

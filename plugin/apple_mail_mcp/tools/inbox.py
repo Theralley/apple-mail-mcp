@@ -5,6 +5,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import quote
 
 from apple_mail_mcp.server import mcp
+from apple_mail_mcp.emlx import fill_body_tokens
 from apple_mail_mcp.core import (
     inject_preferences,
     escape_applescript,
@@ -204,6 +205,8 @@ def list_inbox_emails(
     """
 
     result = run_applescript(script)
+    if include_content:
+        result = fill_body_tokens(result, 200, missing="[Not available]")
     return result
 
 

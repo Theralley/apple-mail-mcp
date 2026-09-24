@@ -6,6 +6,7 @@ from typing import Optional, List, Dict, Any
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import inject_preferences, escape_applescript, run_applescript, inbox_mailbox_script
 from apple_mail_mcp.constants import SKIP_FOLDERS
+from apple_mail_mcp.emlx import get_message_body, preview
 
 
 @mcp.tool()
@@ -456,8 +457,9 @@ def export_emails(
     # Escape all user inputs for AppleScript
     safe_account = escape_applescript(account)
     safe_mailbox = escape_applescript(mailbox)
-    safe_format = escape_applescript(format)
-    safe_save_dir = escape_applescript(save_dir)
+
+    if format not in ("txt", "html"):
+        return f"Error: Invalid format '{format}'. Use: txt, html"
 
     if scope == "single_email":
         if not subject_keyword:
@@ -499,55 +501,13 @@ def export_emails(
                 end repeat
 
                 if foundMessage is not missing value then
-                    set messageSubject to subject of foundMessage
-                    set messageSender to sender of foundMessage
-                    set messageDate to date received of foundMessage
-                    set messageContent to content of foundMessage
-
-                    -- Create safe filename
-                    set safeSubject to messageSubject
-                    set AppleScript's text item delimiters to "/"
-                    set safeSubjectParts to text items of safeSubject
-                    set AppleScript's text item delimiters to "-"
-                    set safeSubject to safeSubjectParts as string
-                    set AppleScript's text item delimiters to ""
-
-                    set fileName to safeSubject & ".{safe_format}"
-                    set filePath to "{safe_save_dir}/" & fileName
-
-                    -- Prepare export content
-                    if "{safe_format}" is "txt" then
-                        set exportContent to "Subject: " & messageSubject & return
-                        set exportContent to exportContent & "From: " & messageSender & return
-                        set exportContent to exportContent & "Date: " & (messageDate as string) & return & return
-                        set exportContent to exportContent & messageContent
-                    else if "{safe_format}" is "html" then
-                        set exportContent to "<html><body>"
-                        set exportContent to exportContent & "<h2>" & messageSubject & "</h2>"
-                        set exportContent to exportContent & "<p><strong>From:</strong> " & messageSender & "</p>"
-                        set exportContent to exportContent & "<p><strong>Date:</strong> " & (messageDate as string) & "</p>"
-                        set exportContent to exportContent & "<hr>" & messageContent
-                        set exportContent to exportContent & "</body></html>"
-                    end if
-
-                    -- Write to file
-                    set fileRef to open for access POSIX file filePath with write permission
-                    set eof of fileRef to 0
-                    write exportContent to fileRef as «class utf8»
-                    close access fileRef
-
-                    set outputText to outputText & "✓ Email exported successfully!" & return & return
-                    set outputText to outputText & "Subject: " & messageSubject & return
-                    set outputText to outputText & "Saved to: " & filePath & return
-
+                    -- The body is read from disk and the file written in Python
+                    return "FOUND|||" & ((id of foundMessage) as string) & "|||" & (subject of foundMessage) & "|||" & (sender of foundMessage) & "|||" & ((date received of foundMessage) as string)
                 else
                     set outputText to outputText & "⚠ No email found matching: {safe_subject_keyword}" & return
                 end if
 
             on error errMsg
-                try
-                    close access file filePath
-                end try
                 return "Error: " & errMsg
             end try
 
@@ -575,68 +535,20 @@ def export_emails(
 
                 set mailboxMessages to every message of targetMailbox
                 set messageCount to count of mailboxMessages
+
+                -- Bodies are read from disk and files written in Python
+                set outputText to "COUNT|||" & messageCount
                 set exportCount to 0
-
-                -- Create export directory
-                set exportDir to "{safe_save_dir}/{safe_mailbox}_export"
-                do shell script "mkdir -p " & quoted form of exportDir
-
                 repeat with aMessage in mailboxMessages
                     if exportCount >= {max_emails} then exit repeat
-
                     try
                         set messageSubject to subject of aMessage
                         set messageSender to sender of aMessage
                         set messageDate to date received of aMessage
-                        set messageContent to content of aMessage
-
-                        -- Create safe filename with index
+                        set outputText to outputText & return & "ENTRY|||" & ((id of aMessage) as string) & "|||" & messageSubject & "|||" & messageSender & "|||" & (messageDate as string)
                         set exportCount to exportCount + 1
-                        set fileName to exportCount & "_" & messageSubject & ".{safe_format}"
-
-                        -- Remove unsafe characters
-                        set AppleScript's text item delimiters to "/"
-                        set fileNameParts to text items of fileName
-                        set AppleScript's text item delimiters to "-"
-                        set fileName to fileNameParts as string
-                        set AppleScript's text item delimiters to ""
-
-                        set filePath to exportDir & "/" & fileName
-
-                        -- Prepare export content
-                        if "{safe_format}" is "txt" then
-                            set exportContent to "Subject: " & messageSubject & return
-                            set exportContent to exportContent & "From: " & messageSender & return
-                            set exportContent to exportContent & "Date: " & (messageDate as string) & return & return
-                            set exportContent to exportContent & messageContent
-                        else if "{safe_format}" is "html" then
-                            set exportContent to "<html><body>"
-                            set exportContent to exportContent & "<h2>" & messageSubject & "</h2>"
-                            set exportContent to exportContent & "<p><strong>From:</strong> " & messageSender & "</p>"
-                            set exportContent to exportContent & "<p><strong>Date:</strong> " & (messageDate as string) & "</p>"
-                            set exportContent to exportContent & "<hr>" & messageContent
-                            set exportContent to exportContent & "</body></html>"
-                        end if
-
-                        -- Write to file
-                        set fileRef to open for access POSIX file filePath with write permission
-                        set eof of fileRef to 0
-                        write exportContent to fileRef as «class utf8»
-                        close access fileRef
-
-                    on error
-                        -- Continue with next email if one fails
                     end try
                 end repeat
-
-                set outputText to outputText & "✓ Mailbox exported successfully!" & return & return
-                set outputText to outputText & "Mailbox: {safe_mailbox}" & return
-                set outputText to outputText & "Total emails in mailbox: " & messageCount & return
-                set outputText to outputText & "Exported: " & exportCount & return
-                if exportCount < messageCount then
-                    set outputText to outputText & "(capped at max_emails={max_emails})" & return
-                end if
-                set outputText to outputText & "Location: " & exportDir & return
 
             on error errMsg
                 return "Error: " & errMsg
@@ -650,7 +562,83 @@ def export_emails(
         return f"Error: Invalid scope '{scope}'. Use: single_email, entire_mailbox"
 
     result = run_applescript(script)
-    return result
+    if result.startswith("Error:"):
+        return result
+    try:
+        if scope == "single_email":
+            return _write_single_export(result, account, mailbox, save_dir, format)
+        return _write_mailbox_export(result, account, mailbox, save_dir, format, max_emails)
+    except OSError as exc:
+        return f"Error: {exc}"
+
+
+def _export_document(subject: str, sender: str, date: str, body: str, format: str) -> str:
+    """File contents in the layout the AppleScript exporter used (CR line ends)."""
+    if format == "txt":
+        return f"Subject: {subject}\rFrom: {sender}\rDate: {date}\r\r{body}"
+    return (
+        f"<html><body><h2>{subject}</h2><p><strong>From:</strong> {sender}</p>"
+        f"<p><strong>Date:</strong> {date}</p><hr>{body}</body></html>"
+    )
+
+
+def _parse_export_entry(line: str):
+    parts = line.split("|||")
+    if len(parts) < 5:
+        return None
+    return parts[1], parts[2], parts[3], "|||".join(parts[4:])
+
+
+def _write_single_export(result, account, mailbox, save_dir, format):
+    entry = _parse_export_entry(result) if result.startswith("FOUND|||") else None
+    if entry is None:
+        return result
+    message_id, subject, sender, date = entry
+    body = get_message_body(message_id, account, mailbox)
+    if body is None:
+        return "Error: could not read the message body"
+    file_path = f"{save_dir}/{subject.replace('/', '-')}.{format}"
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(_export_document(subject, sender, date, body, format))
+    return (
+        "EXPORTING EMAIL\n\n✓ Email exported successfully!\n\n"
+        f"Subject: {subject}\nSaved to: {file_path}"
+    )
+
+
+def _write_mailbox_export(result, account, mailbox, save_dir, format, max_emails):
+    lines = result.split("\n")
+    message_count = int(lines[0].split("|||", 1)[1]) if lines[0].startswith("COUNT|||") else 0
+    export_dir = f"{save_dir}/{mailbox}_export"
+    os.makedirs(export_dir, exist_ok=True)
+    export_count = 0
+    for line in lines[1:]:
+        entry = _parse_export_entry(line) if line.startswith("ENTRY|||") else None
+        if entry is None:
+            continue
+        message_id, subject, sender, date = entry
+        body = get_message_body(message_id, account, mailbox)
+        if body is None:
+            continue  # the AppleScript exporter skipped messages without content
+        export_count += 1
+        file_name = f"{export_count}_{subject}.{format}".replace("/", "-")
+        try:
+            with open(f"{export_dir}/{file_name}", "w", encoding="utf-8") as handle:
+                handle.write(_export_document(subject, sender, date, body, format))
+        except OSError:
+            continue  # continue with the next email if one fails
+    out = "EXPORTING MAILBOX\n\n✓ Mailbox exported successfully!\n\n"
+    out += f"Mailbox: {mailbox}\nTotal emails in mailbox: {message_count}\nExported: {export_count}\n"
+    if export_count < message_count:
+        out += f"(capped at max_emails={max_emails})\n"
+    out += f"Location: {export_dir}"
+    return out
+
+
+def _dashboard_preview(message_id: str, account: str) -> str:
+    """First 150 characters of the body with line breaks as spaces."""
+    body = get_message_body(message_id, account, "INBOX") if message_id.isdigit() else None
+    return preview(body[:150], 0) if body else ""
 
 
 def _get_recent_emails_structured(
@@ -691,22 +679,8 @@ def _get_recent_emails_structured(
                         set messageDate to date received of aMessage
                         set messageRead to read status of aMessage
 
-                        -- Get preview
-                        set messagePreview to ""
-                        try
-                            set msgContent to content of aMessage
-                            if length of msgContent > 150 then
-                                set messagePreview to text 1 thru 150 of msgContent
-                            else
-                                set messagePreview to msgContent
-                            end if
-                            -- Clean up preview
-                            set AppleScript's text item delimiters to {{return, linefeed}}
-                            set contentParts to text items of messagePreview
-                            set AppleScript's text item delimiters to " "
-                            set messagePreview to contentParts as string
-                            set AppleScript's text item delimiters to ""
-                        end try
+                        -- Preview is read from disk in Python (emlx.py); pass the id
+                        set messagePreview to (id of aMessage) as string
 
                         -- Format as parseable string: SUBJECT|||SENDER|||DATE|||READ|||ACCOUNT|||PREVIEW
                         set emailRecord to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & messageRead & "|||" & accountName & "|||" & messagePreview
@@ -741,7 +715,7 @@ def _get_recent_emails_structured(
                         'date': parts[2].strip(),
                         'is_read': parts[3].strip().lower() == 'true',
                         'account': parts[4].strip(),
-                        'preview': parts[5].strip() if len(parts) > 5 else ''
+                        'preview': _dashboard_preview(parts[5].strip(), parts[4].strip()) if len(parts) > 5 else ''
                     })
 
     # Emails arrive in inbox order (newest first per account)

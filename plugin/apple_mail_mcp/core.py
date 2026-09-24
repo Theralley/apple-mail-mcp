@@ -409,28 +409,23 @@ def inbox_mailbox_script(
                 end if"""
 
 
-def content_preview_script(max_length: int, output_var: str = "outputText") -> str:
-    """Return AppleScript snippet to extract and truncate email content preview."""
+def content_preview_script(
+    max_length: int,
+    output_var: str = "outputText",
+    account_expr: str = "accountName",
+    mailbox_expr: str = '"INBOX"',
+) -> str:
+    """Return AppleScript that appends a "Content:" line holding a body token.
+
+    The body itself is never requested from Mail (see emlx.py); the caller
+    passes the script output through ``emlx.fill_body_tokens(output,
+    max_length, missing="[Not available]")``.
+    """
+    from apple_mail_mcp.emlx import body_token_script
+
+    token = body_token_script("aMessage", account_expr, mailbox_expr)
     return f"""
-                            try
-                                set msgContent to content of aMessage
-                                set AppleScript's text item delimiters to {{return, linefeed}}
-                                set contentParts to text items of msgContent
-                                set AppleScript's text item delimiters to " "
-                                set cleanText to contentParts as string
-                                set AppleScript's text item delimiters to ""
-
-                                if length of cleanText > {max_length} then
-                                    set contentPreview to text 1 thru {max_length} of cleanText & "..."
-                                else
-                                    set contentPreview to cleanText
-                                end if
-
-                                set {output_var} to {output_var} & "   Content: " & contentPreview & return
-                            on error
-                                set {output_var} to {output_var} & "   Content: [Not available]" & return
-                            end try"""
-
+                            set {output_var} to {output_var} & "   Content: " & {token} & return"""
 
 def date_cutoff_script(days_back: int, var_name: str = "cutoffDate") -> str:
     """Return AppleScript snippet to set a date cutoff variable."""
@@ -575,8 +570,9 @@ def build_email_fields_script(
     """Return AppleScript snippet that extracts common fields from an email.
 
     Sets local variables: messageSubject, messageSender, messageDate,
-    messageRead.  Optionally appends a cleaned content preview to
-    *output_var*.
+    messageRead.  With *include_content* it also appends a "Content:" line
+    holding a body token; pass the output through
+    ``emlx.fill_body_tokens(output, max_content_length, "[Not available]")``.
     """
     fields = f"""set messageSubject to subject of {message_var}
                                 set messageSender to sender of {message_var}
@@ -586,21 +582,8 @@ def build_email_fields_script(
     if not include_content:
         return fields
 
-    content = f"""
-                                try
-                                    set msgContent to content of {message_var}
-                                    set AppleScript's text item delimiters to {{return, linefeed}}
-                                    set contentParts to text items of msgContent
-                                    set AppleScript's text item delimiters to " "
-                                    set cleanText to contentParts as string
-                                    set AppleScript's text item delimiters to ""
-                                    if length of cleanText > {max_content_length} then
-                                        set contentPreview to text 1 thru {max_content_length} of cleanText & "..."
-                                    else
-                                        set contentPreview to cleanText
-                                    end if
-                                    set {output_var} to {output_var} & "   Content: " & contentPreview & return
-                                on error
-                                    set {output_var} to {output_var} & "   Content: [Not available]" & return
-                                end try"""
-    return fields + content
+    from apple_mail_mcp.emlx import body_token_script
+
+    token = body_token_script(message_var)
+    return fields + f"""
+                                set {output_var} to {output_var} & "   Content: " & {token} & return"""

@@ -17,7 +17,11 @@ of messages a call touches:
 - Fetching one property for a whole mailbox in one event takes about 1 s for
   7,000 messages when Mail is warm. The first access to a large mailbox after
   Mail launches can take 45 s.
-- Reading a message body (`content`) takes 1 to 7 s per message.
+- Message bodies are read from Mail's `.emlx` files on disk, which is fast
+  and does not touch Mail. The server never asks Mail for `content`, which
+  renders HTML on Mail's main thread and can freeze or crash it. Without
+  Full Disk Access it falls back to Mail's raw `source` of each message,
+  which is slower.
 - The server kills a call after 120 s (180 s for `search_emails`) and returns
   `AppleScript execution timed out after Ns ...`.
 

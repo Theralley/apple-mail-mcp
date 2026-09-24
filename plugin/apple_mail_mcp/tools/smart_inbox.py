@@ -12,6 +12,7 @@ from apple_mail_mcp.core import (
     date_cutoff_script,
     LOWERCASE_HANDLER,
 )
+from apple_mail_mcp.emlx import get_message_body
 from apple_mail_mcp.constants import (
     NEWSLETTER_PLATFORM_PATTERNS,
     NEWSLETTER_KEYWORD_PATTERNS,
@@ -335,13 +336,12 @@ def get_needs_response(
             -- Scan target mailbox: let Mail pre-filter to unread (and the date
             -- window) instead of reading every message one by one
             {mailbox_fetch}
-            set highPriority to {{}}
-            set normalPriority to {{}}
+            set candidateEntries to {{}}
             set totalChecked to 0
             set flagColorNames to {{{_FLAG_COLOR_NAME_LIST}}}
 
             repeat with aMessage in mailboxMessages
-                if (count of highPriority) + (count of normalPriority) >= {max_results} then exit repeat
+                if (count of candidateEntries) >= {max_results} then exit repeat
 
                 try
                     set messageDate to date received of aMessage
@@ -370,67 +370,27 @@ def get_needs_response(
                             end repeat
 
                             if not alreadyReplied then
-                                -- Determine priority
-                                set hasQuestion to (messageSubject contains "?")
-                                try
-                                    set msgContent to content of aMessage
-                                    if length of msgContent > 500 then
-                                        set msgContent to text 1 thru 500 of msgContent
-                                    end if
-                                    if msgContent contains "?" then set hasQuestion to true
-                                end try
-
+                                -- Priority is decided in Python: whether the body asks a
+                                -- question is read from disk (emlx.py), never from Mail.
                                 {read_flag_index_script("flagIndex")}
-                                set isFlagged to (flagIndex is not -1)
-                                set flagLabel to "flagged"
-                                if flagIndex >= 0 and flagIndex < 7 then
-                                    set flagLabel to "flagged " & item (flagIndex + 1) of flagColorNames
+                                set flagLabel to ""
+                                if flagIndex is not -1 then
+                                    set flagLabel to "flagged"
+                                    if flagIndex >= 0 and flagIndex < 7 then
+                                        set flagLabel to "flagged " & item (flagIndex + 1) of flagColorNames
+                                    end if
                                 end if
 
-                                set emailEntry to messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||"
-                                if hasQuestion or isFlagged then
-                                    if hasQuestion and isFlagged then
-                                        set emailEntry to emailEntry & "HIGH (" & flagLabel & " + question)"
-                                    else if isFlagged then
-                                        set emailEntry to emailEntry & "HIGH (" & flagLabel & ")"
-                                    else
-                                        set emailEntry to emailEntry & "MEDIUM (contains question)"
-                                    end if
-                                    set end of highPriority to emailEntry
-                                else
-                                    set emailEntry to emailEntry & "NORMAL"
-                                    set end of normalPriority to emailEntry
-                                end if
+                                set end of candidateEntries to "ENTRY|||" & ((id of aMessage) as string) & "|||" & messageSubject & "|||" & messageSender & "|||" & (messageDate as string) & "|||" & flagLabel
                             end if
                         end if
                     end if
                 end try
             end repeat
 
-            -- Format output: high priority first, then normal
-            set resultCount to 0
-            repeat with entry in highPriority
-                set resultCount to resultCount + 1
-                set AppleScript's text item delimiters to "|||"
-                set parts to text items of entry
-                set AppleScript's text item delimiters to ""
-                set outputText to outputText & resultCount & ". [" & item 4 of parts & "] " & item 1 of parts & return
-                set outputText to outputText & "   From: " & item 2 of parts & return
-                set outputText to outputText & "   Date: " & item 3 of parts & return & return
-            end repeat
-
-            repeat with entry in normalPriority
-                set resultCount to resultCount + 1
-                set AppleScript's text item delimiters to "|||"
-                set parts to text items of entry
-                set AppleScript's text item delimiters to ""
-                set outputText to outputText & resultCount & ". [" & item 4 of parts & "] " & item 1 of parts & return
-                set outputText to outputText & "   From: " & item 2 of parts & return
-                set outputText to outputText & "   Date: " & item 3 of parts & return & return
-            end repeat
-
-            set outputText to outputText & "========================================" & return
-            set outputText to outputText & "Found " & resultCount & " email(s) needing response." & return
+            set AppleScript's text item delimiters to return
+            set outputText to outputText & (candidateEntries as string)
+            set AppleScript's text item delimiters to ""
 
         on error errMsg
             return "Error: " & errMsg
@@ -443,7 +403,48 @@ def get_needs_response(
     {_strip_subject_prefixes_script()}
     '''
 
-    return run_applescript(script)
+    result = run_applescript(script)
+    if result.startswith("Error:"):
+        return result
+    return _format_needs_response(result, account, mailbox)
+
+
+def _format_needs_response(result: str, account: str, mailbox: str) -> str:
+    """Rank the candidates the script found and format the report.
+
+    HIGH: flagged (plus "+ question" when it also asks one); MEDIUM: asks a
+    question in the subject or in the first 500 characters of the body;
+    NORMAL: the rest. The body comes from disk via emlx.py.
+    """
+    header = []
+    high, normal = [], []
+    for line in result.split("\n"):
+        if not line.startswith("ENTRY|||"):
+            header.append(line)
+            continue
+        parts = line.split("|||")
+        if len(parts) < 6:
+            continue
+        message_id, subject, sender, date = parts[1], parts[2], parts[3], parts[4]
+        flag_label = "|||".join(parts[5:])
+        has_question = "?" in subject
+        if not has_question:
+            body = get_message_body(message_id, account, mailbox)
+            has_question = bool(body) and "?" in body[:500]
+        if flag_label:
+            label = f"HIGH ({flag_label} + question)" if has_question else f"HIGH ({flag_label})"
+            high.append((subject, sender, date, label))
+        elif has_question:
+            high.append((subject, sender, date, "MEDIUM (contains question)"))
+        else:
+            normal.append((subject, sender, date, "NORMAL"))
+
+    out = "\n".join(header).rstrip("\n") + "\n\n"
+    for number, (subject, sender, date, label) in enumerate(high + normal, start=1):
+        out += f"{number}. [{label}] {subject}\n   From: {sender}\n   Date: {date}\n\n"
+    out += "========================================\n"
+    out += f"Found {len(high) + len(normal)} email(s) needing response."
+    return out
 
 
 @mcp.tool()

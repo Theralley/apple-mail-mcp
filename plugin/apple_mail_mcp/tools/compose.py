@@ -864,9 +864,9 @@ tell application "Mail"
             -- another app holds focus, or when the machine is busy), the paste lands
             -- nowhere and an EMPTY reply is sent with no error returned.
             --
-            -- We deliberately do NOT verify the paste by reading `content of
-            -- replyMessage` afterwards: Mail's GUI editor buffer is decoupled from the
-            -- scriptable `content` property, so reading it always returns the pre-paste
+            -- We deliberately do NOT verify the paste by reading the reply's scriptable
+            -- `content` property afterwards: Mail's GUI editor buffer is decoupled from
+            -- that property, so reading it always returns the pre-paste
             -- value (verified empirically — it reports 0 chars even after a successful
             -- paste). A content-read-back guard would therefore false-fail every send.
             -- Instead we make the paste deterministic by polling until Mail is genuinely

@@ -30,7 +30,7 @@ description: Find an email conversation in Apple Mail and summarise it through t
 
 ## Rules
 
-- Use `body_text` in `search_emails` only as a last resort, and always with a
-  date range. It reads every candidate body, and it stops after about two
-  minutes with a note that the results are partial.
+- `body_text` in `search_emails` reads candidate bodies from disk: about 11 s
+  for a 2,300-message inbox. Add a date range or sender on bigger mailboxes.
+  It stops after two minutes and marks the results as partial.
 - Summarise and paraphrase. Do not paste whole bodies back unless the user asks.

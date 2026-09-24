@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Message bodies are read from disk; the server never asks Mail for
+  `content`.** `content of <message>` makes Mail convert HTML to text through
+  legacy WebKit (NSHTMLReader) on its main thread. That cost 0.35-0.7 s per
+  message, blocked every other client, and matches the stack of Mail's
+  recurring ExcUserFault crash reports. The new `emlx.py` finds
+  `~/Library/Mail/V*/…/<Box>.mbox/<uuid>/Data/<id digits>/Messages/<id>.emlx`
+  (or `.partial.emlx`) and parses it with the stdlib email package, preferring
+  text/plain and converting HTML itself. If the file is missing or
+  unreadable, it falls back to `source of <message>` (raw MIME, no rendering).
+  AppleScript now returns ids and metadata only. Body text search, content
+  previews (`list_inbox_emails`, `search_emails`, `get_email_thread`, the
+  dashboard), `get_needs_response`'s question check and `export_emails` use
+  it. A test fails if any AppleScript in the package reads `content of`. On a
+  2,335-message inbox, a full `body_text` search went from 138 s (stopped
+  incomplete) to 11 s (complete).
 - **`--read-only` is now a strict allowlist:** read mail, save attachments,
   export to local files, sync, and create or list drafts; nothing else.
   Previously it only removed the three send tools, so moving, flagging,

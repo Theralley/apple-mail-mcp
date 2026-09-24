@@ -1,9 +1,8 @@
 """Raw source tool: return the full RFC 822 source of a message.
 
-The other body-extraction paths in this MCP go through ``content of aMessage``
-— Mail.app's rendered (display-text) representation. That path collapses HTML
-to plain text and replaces embedded objects (including hyperlinks) with
-U+FFFC, so hrefs and MIME structure don't survive.
+The other body-extraction paths in this MCP return plain text decoded from
+the on-disk ``.emlx`` file (see emlx.py), with HTML reduced to text, so hrefs
+and MIME structure don't survive there.
 
 This tool exposes the parallel ``source of aMessage`` property instead. Same
 property that produces the ``.partial.emlx`` file content on disk. The caller
