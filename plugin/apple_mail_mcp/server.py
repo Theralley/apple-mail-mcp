@@ -18,8 +18,10 @@ READ_ONLY = False
 # Tools registered under --read-only. This is an allowlist: any tool not named
 # here (including tools added later) is removed at startup and refused at call
 # time. Read-only means: read mail, save attachments / exports to local files,
-# fetch from the server, and create or list drafts — nothing that sends,
-# moves, flags, marks, deletes or creates mailboxes.
+# fetch from the server, and create, list or delete drafts — nothing that
+# sends, moves, flags, marks, deletes received mail or creates mailboxes.
+# Deleting a draft only removes something this server (or the user) wrote and
+# never sent; it refuses when more than one draft matches.
 READ_ONLY_ALLOWED_TOOLS = frozenset({
     # Reading
     "list_accounts",
@@ -47,7 +49,7 @@ READ_ONLY_ALLOWED_TOOLS = frozenset({
     "manage_drafts",
 })
 
-READ_ONLY_DRAFT_ACTIONS = frozenset({"create", "list"})
+READ_ONLY_DRAFT_ACTIONS = frozenset({"create", "list", "delete"})
 
 
 def read_only_block(tool_name: str, action: Optional[str] = None) -> Optional[str]:

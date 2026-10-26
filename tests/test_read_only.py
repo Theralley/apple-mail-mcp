@@ -1,4 +1,4 @@
-"""--read-only is a strict allowlist: read, save attachments, create drafts.
+"""--read-only is a strict allowlist: read, save attachments, create, list and delete drafts.
 
 The expected tool set is spelled out here independently of
 server.READ_ONLY_ALLOWED_TOOLS, so widening the allowlist has to be done
@@ -106,7 +106,7 @@ def test_denied_tools_refuse_at_call_time(read_only_flag, call):
     run_manage.assert_not_called()
 
 
-@pytest.mark.parametrize("action", ["send", "delete", "open", "unknown"])
+@pytest.mark.parametrize("action", ["send", "open", "unknown"])
 def test_manage_drafts_refuses_other_actions(read_only_flag, action):
     with patch.object(compose_tools, "run_applescript") as run:
         result = compose_tools.manage_drafts(
@@ -129,3 +129,62 @@ def test_manage_drafts_allows_create_and_list(read_only_flag, kwargs):
         result = compose_tools.manage_drafts(account="Work", **kwargs)
     assert "blocked" not in result
     run.assert_called_once()
+
+
+# ---- delete under --read-only: drafts only, never a guess between two -------
+
+def _matches(*rows):
+    """The match script's output: OK, then id<TAB>subject<TAB>created per draft."""
+    return "OK\n" + "".join(f"{i}\t{subj}\t{created}\n" for i, subj, created in rows)
+
+
+def test_delete_of_a_unique_match_deletes_that_draft_by_id(read_only_flag):
+    with patch.object(
+        compose_tools, "run_applescript",
+        side_effect=[_matches((42, "Quarterly report", "26 Oct")), "✓ Draft deleted successfully!"],
+    ) as run:
+        result = compose_tools.manage_drafts(account="Work", action="delete", draft_subject="Quarterly")
+    assert "blocked" not in result and "deleted" in result
+    assert run.call_count == 2
+    assert "whose id is 42" in run.call_args_list[1].args[0]
+
+
+def test_delete_refuses_when_several_drafts_match_and_lists_them(read_only_flag):
+    # 2026-10-26: a draft and its corrected copy shared a subject; the old code
+    # deleted whichever came first.
+    with patch.object(
+        compose_tools, "run_applescript",
+        return_value=_matches((41, "Quarterly report", "13:46"), (42, "Quarterly report", "15:20")),
+    ) as run:
+        result = compose_tools.manage_drafts(account="Work", action="delete", draft_subject="Quarterly")
+    assert "2 drafts match" in result and "Nothing was deleted" in result
+    assert "ID 41" in result and "ID 42" in result
+    run.assert_called_once()  # only the lookup; no delete script ran
+
+
+def test_delete_by_draft_id_skips_the_subject_search(read_only_flag):
+    with patch.object(compose_tools, "run_applescript", return_value="✓ Draft deleted successfully!") as run:
+        result = compose_tools.manage_drafts(account="Work", action="delete", draft_id=41)
+    assert "deleted" in result
+    run.assert_called_once()
+    assert "whose id is 41" in run.call_args.args[0]
+
+
+@pytest.mark.parametrize("bad", ["41; delete every message", -1, "abc"])
+def test_delete_refuses_a_draft_id_that_is_not_a_number(read_only_flag, bad):
+    with patch.object(compose_tools, "run_applescript") as run:
+        result = compose_tools.manage_drafts(account="Work", action="delete", draft_id=bad)
+    assert result.startswith("Error: draft_id must be a number")
+    run.assert_not_called()
+
+
+def test_delete_with_no_match_or_a_lookup_error_deletes_nothing(read_only_flag):
+    with patch.object(compose_tools, "run_applescript", return_value="OK\n") as run:
+        result = compose_tools.manage_drafts(account="Work", action="delete", draft_subject="missing")
+    assert "No draft found" in result
+    run.assert_called_once()
+    with patch.object(compose_tools, "run_applescript", return_value="Error: no such account") as run:
+        result = compose_tools.manage_drafts(account="Work", action="delete", draft_subject="x")
+    assert result == "Error: no such account"
+    run.assert_called_once()
+

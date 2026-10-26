@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`manage_drafts` `delete` is allowed under `--read-only`, and never
+  guesses.** Replacing a draft with a corrected copy left two drafts with
+  the same subject and no way to remove the old one. Delete used to take the
+  first draft whose subject contained the keyword; now the match is made in
+  Python, and when more than one draft matches nothing is deleted and the
+  matches are listed with their IDs. `list` shows each draft's `ID`, and the
+  new `draft_id` parameter deletes exactly that draft (`whose id is N`, the
+  value must be a number). Only the Drafts mailbox is touched; deleting
+  received mail, `send` and `open` stay blocked under `--read-only`.
+  Measured: Mail autosaves a newly created draft once, about 20 seconds
+  after `create`, as a new message; a draft deleted before that comes back
+  as the autosaved copy (README).
 - **Listings, counts and searches read Mail's Envelope Index instead of
   asking Mail for messages.** `every message of <mailbox>`, `count of
   messages`, bulk property reads and whose-queries make Mail run a full

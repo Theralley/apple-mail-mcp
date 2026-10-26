@@ -1408,6 +1408,51 @@ tell application "Mail"
             os.unlink(fwd_html_temp_path)
 
 
+def _drafts_matching(safe_account: str, draft_subject: str):
+    """Drafts in the account whose subject contains ``draft_subject``.
+
+    Returns ``[(id, subject, created), ...]`` or an error string. The decision
+    about which draft to touch is made here in Python, not inside the script:
+    the old delete took the first subject match, so two drafts with the same
+    subject (a draft and its corrected copy) meant deleting one at random.
+    """
+    safe_draft_subject = escape_applescript(draft_subject)
+    script = f'''
+    tell application "Mail"
+        try
+            set draftsMailbox to mailbox "Drafts" of account "{safe_account}"
+            set outputText to ""
+            repeat with aDraft in (every message of draftsMailbox)
+                try
+                    set draftSubject to subject of aDraft
+                    if draftSubject contains "{safe_draft_subject}" then
+                        set draftCreated to ""
+                        try
+                            set draftCreated to (date sent of aDraft) as string
+                        end try
+                        set outputText to outputText & ((id of aDraft) as string) & tab & draftSubject & tab & draftCreated & linefeed
+                    end if
+                end try
+            end repeat
+            return "OK" & linefeed & outputText
+        on error errMsg
+            return "Error: " & errMsg
+        end try
+    end tell
+    '''
+    raw = run_applescript(script) or ""
+    lines = raw.strip().splitlines()
+    if not lines or lines[0].strip() != "OK":
+        return raw.strip() or "Error: could not read the Drafts mailbox"
+    matches = []
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0].strip().isdigit():
+            created = parts[2].strip() if len(parts) > 2 else ""
+            matches.append((int(parts[0]), parts[1], created))
+    return matches
+
+
 @mcp.tool()
 @inject_preferences
 def manage_drafts(
@@ -1420,11 +1465,12 @@ def manage_drafts(
     bcc: Optional[str] = None,
     draft_subject: Optional[str] = None,
     from_address: Optional[str] = None,
+    draft_id: Optional[int] = None,
 ) -> str:
     """
     Manage draft emails - list, create, send, open, or delete drafts.
 
-    Under --read-only only "create" and "list" are allowed.
+    Under --read-only only "create", "list" and "delete" are allowed.
 
     Args:
         account: Account name (e.g., "Gmail", "Work")
@@ -1436,6 +1482,7 @@ def manage_drafts(
         bcc: Optional BCC recipients for create
         draft_subject: Subject keyword to find draft (required for send/open/delete)
         from_address: Optional sender address for new drafts (action="create"). Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
+        draft_id: Exact draft ID as shown by action="list" (delete only). Required when several drafts match draft_subject; delete never guesses between them.
 
     Returns:
         Formatted output based on action
@@ -1468,7 +1515,8 @@ def manage_drafts(
                         set draftDate to date sent of aDraft
 
                         set outputText to outputText & "✉ " & draftSubject & return
-                        set outputText to outputText & "   Created: " & (draftDate as string) & return & return
+                        set outputText to outputText & "   Created: " & (draftDate as string) & return
+                        set outputText to outputText & "   ID: " & ((id of aDraft) as string) & return & return
                     end try
                 end repeat
 
@@ -1660,51 +1708,46 @@ def manage_drafts(
         '''
 
     elif action == "delete":
-        if not draft_subject:
-            return "Error: 'draft_subject' is required for deleting drafts"
-
-        safe_draft_subject = escape_applescript(draft_subject)
+        if draft_id is None and not draft_subject:
+            return "Error: 'draft_subject' or 'draft_id' is required for deleting drafts"
+        if draft_id is None:
+            matches = _drafts_matching(safe_account, draft_subject)
+            if isinstance(matches, str):
+                return matches
+            if not matches:
+                return f"⚠ No draft found matching: {draft_subject}"
+            if len(matches) > 1:
+                rows = "\n".join(
+                    f"  ID {mid}: {subj} (created {created})" for mid, subj, created in matches
+                )
+                return (
+                    f"Error: {len(matches)} drafts match '{draft_subject}'. Nothing was "
+                    f"deleted. Pass draft_id for the one to delete:\n{rows}"
+                )
+            draft_id = matches[0][0]
+        try:
+            target_id = int(draft_id)
+        except (TypeError, ValueError):
+            return f"Error: draft_id must be a number from action='list', got {draft_id!r}"
+        if target_id < 0:
+            return f"Error: draft_id must be a number from action='list', got {draft_id!r}"
 
         script = f'''
         tell application "Mail"
-            set outputText to "DELETING DRAFT" & return & return
-
             try
                 set targetAccount to account "{safe_account}"
                 set draftsMailbox to mailbox "Drafts" of targetAccount
-                set draftMessages to every message of draftsMailbox
-                set foundDraft to missing value
-
-                -- Find the draft
-                repeat with aDraft in draftMessages
-                    try
-                        set draftSubject to subject of aDraft
-
-                        if draftSubject contains "{safe_draft_subject}" then
-                            set foundDraft to aDraft
-                            exit repeat
-                        end if
-                    end try
-                end repeat
-
-                if foundDraft is not missing value then
-                    set draftSubject to subject of foundDraft
-
-                    -- Delete the draft
-                    delete foundDraft
-
-                    set outputText to outputText & "✓ Draft deleted successfully!" & return
-                    set outputText to outputText & "Subject: " & draftSubject & return
-
-                else
-                    set outputText to outputText & "⚠ No draft found matching: {safe_draft_subject}" & return
+                set foundDrafts to (every message of draftsMailbox whose id is {target_id})
+                if (count of foundDrafts) is 0 then
+                    return "⚠ No draft with ID {target_id} in Drafts of {safe_account}"
                 end if
-
+                set foundDraft to item 1 of foundDrafts
+                set draftSubject to subject of foundDraft
+                delete foundDraft
+                return "DELETING DRAFT" & return & return & "✓ Draft deleted successfully!" & return & "Subject: " & draftSubject & return & "ID: {target_id}"
             on error errMsg
                 return "Error: " & errMsg
             end try
-
-            return outputText
         end tell
         '''
 
