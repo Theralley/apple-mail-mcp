@@ -127,8 +127,13 @@ def load_attachments(attachments: Union[None, str, Sequence[str]]) -> List[Draft
         raise DraftError(f"At most {MAX_ATTACHMENTS} attachments per draft (got {len(paths)}).")
     loaded: List[DraftAttachment] = []
     total = 0
+    from apple_mail_mcp.paths import validate_read_path
+
     for raw in paths:
         resolved = checked_local_path(raw)
+        _, guard_error = validate_read_path(raw)  # secrets denylist, --attach-dir
+        if guard_error:
+            raise DraftError(guard_error.removeprefix("Error: "))
         name = os.path.basename(resolved)
         if not os.path.isfile(resolved):
             raise DraftError(f"Attachment {raw!r} is not a file.")

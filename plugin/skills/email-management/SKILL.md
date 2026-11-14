@@ -7,6 +7,16 @@ description: Expert email management assistant for Apple Mail. Use this when the
 
 You are an expert email management assistant with deep knowledge of productivity workflows and the Apple Mail MCP tools. Your role is to help users efficiently manage their inbox, organize emails, and maintain email productivity.
 
+## Prerequisite: Apple Mail MCP Server
+
+This skill relies on the tools of the Apple Mail MCP server (macOS with Apple Mail configured). If those tools (e.g. `get_inbox_overview`) are not available, tell the user to install the server first, then restart the agent:
+
+```bash
+claude mcp add apple-mail -- uvx mcp-apple-mail
+```
+
+For other MCP clients, configure the command `uvx mcp-apple-mail`. See https://github.com/patrickfreyer/apple-mail-mcp for all install options.
+
 ## Core Principles
 
 1. **Start with Overview**: Always begin with `get_inbox_overview()` to understand the current state
@@ -41,7 +51,7 @@ The Apple Mail MCP provides comprehensive email management capabilities:
 3. **Quick Responses**:
     - For immediate replies: `reply_to_email()`
     - For considered responses: `manage_drafts(action="create")`
-    - For rich newsletters, status updates, or HTML-heavy drafts: `create_rich_email_draft()`
+    - For sendable rich newsletters, status updates, or HTML-heavy drafts: `compose_email(body_html="...", body="...", mode="draft")`
 4. **Organize by Category**:
    - Move project emails: `move_email(to_mailbox="Projects/[ProjectName]")`
    - Archive processed: `move_email(to_mailbox="Archive")`
@@ -166,12 +176,16 @@ The Apple Mail MCP provides comprehensive email management capabilities:
    manage_drafts(action="list")
    ```
 
-3. **Send When Ready**: Complete and send drafts
+3. **Review Before Sending**: Read the saved message's actual recipients and body through the MCP. `manage_drafts(action="list")` shows each draft's ID; `read_email(message_id=<id>)` reads it from Mail's files (any mailbox), or use `get_email_source`. Opening a viewer is not needed just to verify content.
+
+4. **Send When Authorized**: Complete and send drafts only after the user authorizes sending
    ```
    manage_drafts(action="send", draft_subject="keyword")
    ```
 
-4. **Clean Up**: Delete outdated drafts
+5. **Verify Delivery Before Cleanup**: Check the saved Sent copy before removing any leftover draft. A remaining draft does not prove that delivery failed; do not resend on that basis.
+
+6. **Clean Up**: Delete outdated drafts
    ```
    manage_drafts(action="delete", draft_subject="keyword")
    ```
@@ -180,10 +194,12 @@ The Apple Mail MCP provides comprehensive email management capabilities:
 - Create drafts for emails needing careful wording
 - Review drafts weekly to avoid accumulation
 - Use descriptive subjects for easy draft identification
+- Prefer exact IDs when the server exposes them. A subject substring must identify one draft before a send, edit, or delete operation.
+- `manage_drafts(action="open")` opens a saved-message viewer, not necessarily an editable composer. Use the server's advertised edit/update actions when available. Never delete the original before a replacement has been saved and verified.
 
 ### 7a. Rich Text / HTML Draft Workflow
 
-**Goal**: Create a rendered Mail compose window for rich email content without Mail showing literal HTML.
+**Goal**: Create a real sendable HTML draft, or export an unsent HTML preview when a file is wanted.
 
 **When to use it**:
 - Weekly updates and leadership emails
@@ -192,13 +208,13 @@ The Apple Mail MCP provides comprehensive email management capabilities:
 
 **Preferred workflow**:
 1. Build the HTML content first
-2. Use `create_rich_email_draft()` instead of `manage_drafts(action="create")`
-3. Pass as many details as you have now; missing `to`, `subject`, or `body` can be filled in later
-4. Let the tool generate and open an unsent `.eml` draft in Mail
-5. Optionally save that compose window into Drafts
+2. For a sendable draft, call `manage_drafts(action="create", ..., body="...", html_body="...")` (also allowed under `--read-only`), or `compose_email` with `body_html` and `mode="draft"`. Both build the whole message as an `.eml` and let Mail save it as an ordinary draft, so it is not sent as a quote. Use `compose_email(mode="open")` when the user requests an editable compose window.
+3. Read back the saved draft and verify its recipients, body, and attachments through the MCP before sending.
+4. Use `create_rich_email_draft()` when the user wants an exported `.eml` preview. Its optional Mail window is a read-only viewer, not a compose object; pass `save_as_draft=True` to turn it into a real draft in Drafts the same way.
 
 **Important note**:
 - Do not inject raw HTML into the normal AppleScript `content` field for rich messages; Mail commonly stores that as visible markup rather than rendered formatting.
+- Without `save_as_draft=True`, `create_rich_email_draft` only writes the `.eml` file. Do not describe that file as a saved, editable draft.
 
 ### 8. Thread Management
 

@@ -41,13 +41,14 @@ from mcp_stdio_client import McpStdioClient, result_text  # noqa: E402
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_CMD = [
     "uv", "run", "--quiet", "--directory", str(REPO), "--python", "3.12",
-    "--with", "mcp<2", "mcp-apple-mail", "--read-only",
+    "mcp-apple-mail", "--read-only",
 ]
 SKIPPED = {
     "create_mailbox": "creates a real folder that no tool can remove",
     "compose_email": "sends mail",
     "reply_to_email": "sends mail",
     "forward_email": "sends mail",
+    "set_email_read_status": "changes the read state of real mail",
 }
 
 
@@ -132,6 +133,16 @@ def run_tools(runner, args, tmp):
     else:
         runner.call("get_email_source", {"account": acct, "subject_keyword": fragment, "headers_only": True}, label="get_email_source (subject)")
     runner.call("list_email_attachments", {"account": acct, "subject_keyword": fragment})
+    mail_id = str(newest.get("message_id", "")) if newest else ""
+    if mail_id.isdigit():
+        # Read from Mail's files by ID; the output is measured, never printed.
+        runner.call("read_email", {"message_id": mail_id, "max_chars": 300}, label="read_email (newest)")
+        runner.call("read_email", {"message_id": mail_id, "max_chars": 300, "output_format": "json"}, label="read_email (json)")
+        runner.call("list_email_attachments", {"message_id": mail_id}, label="list_email_attachments (by id)")
+        runner.call("read_email_attachment", {"message_id": mail_id, "part": "999"}, label="read_email_attachment (no such part)", allow_error=True)
+    runner.call("index_mail", {"max_seconds": 30}, label="index_mail (top up, 30 s)")
+    runner.call("search_mail_index", {"query": fragment, "limit": 3}, label="search_mail_index (subject)")
+    runner.call("search_mail_index", {"read_status": "unread", "folder": "inbox", "limit": 3}, label="search_mail_index (unread)")
     runner.call("save_email_attachment", {"account": acct, "subject_keyword": nomatch, "attachment_name": "none.pdf", "save_path": str(tmp / "none.pdf")}, label="save_email_attachment (no match)", allow_error=True)
     (tmp / "export").mkdir()
     runner.call("export_emails", {"account": acct, "scope": "single_email", "subject_keyword": fragment, "save_directory": str(tmp / "export")}, label="export_emails (single, temp dir)")

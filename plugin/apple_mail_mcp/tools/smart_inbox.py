@@ -105,7 +105,7 @@ def get_awaiting_reply(
 
     Args:
         account: Account name (e.g., "Gmail", "Work", "Personal")
-        days_back: How many days back to check sent emails (default: 7)
+        days_back: How many days back to check sent emails (default: 7, 0 = all time)
         exclude_noreply: Skip emails sent to noreply/no-reply addresses (default: True)
         max_results: Maximum results to return (default: 20)
 
@@ -183,7 +183,6 @@ def get_awaiting_reply(
             -- Now scan sent emails
             {sent_fetch}
             set resultCount to 0
-            set checkedCount to 0
 
             repeat with aMessage in sentMessages
                 if resultCount >= {max_results} then exit repeat

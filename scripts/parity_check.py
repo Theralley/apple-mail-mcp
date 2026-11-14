@@ -14,7 +14,7 @@ is read-only. Arguments (the account name, filters) are taken from the
 command line or derived from the newest inbox message; nothing about the
 mailbox is stored in this file.
 
-    uv run --python 3.12 --with 'mcp<2' python scripts/parity_check.py \\
+    uv run --python 3.12 python scripts/parity_check.py \\
         --account "Work" [--window 20] [--only get_top_senders ...] \\
         [--heavy] [--quiet]
 

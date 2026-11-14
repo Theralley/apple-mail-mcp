@@ -168,7 +168,7 @@ class SubjectPrefilterTests(unittest.TestCase):
             )
 
         self.assertIn(
-            '(every message of inboxMailbox whose subject contains "Invoice")',
+            '(every message of targetMailbox whose subject contains "Invoice")',
             captured["script"],
         )
 

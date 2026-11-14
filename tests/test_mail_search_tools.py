@@ -434,6 +434,10 @@ class SearchToolTests(unittest.TestCase):
         self.assertIn("flag_color cannot be combined", result)
         mock_run.assert_not_called()
 
+    # -- Issue #41: search_emails hangs / returns empty on very large
+    # (90,000+ message) mailboxes because it always materializes the full
+    # mailbox via `every message of currentMailbox [whose ...]`, an
+    # unindexed AppleScript scan with no upper bound. --------------------
 
 class ManageToolTests(unittest.TestCase):
     def test_update_email_status_with_message_ids_uses_exact_id_condition(self):

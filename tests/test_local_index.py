@@ -518,3 +518,19 @@ def test_index_mail_all_scope(mail):
     assert "ID: 203" in out and "[Gmail]/All Mail" in out
     assert mail_index.index_mail(scope="inbox,sent,other").startswith("LOCAL MAIL INDEX")
     assert mail_index.index_mail(scope="trash").startswith("Error")
+
+
+def test_read_email_json_and_upstream_arguments(mail):
+    import json
+
+    from apple_mail_mcp.tools import mail_index
+
+    data = json.loads(mail_index.read_email(" 101 ", output_format="json", account="Work", mailbox="INBOX"))
+    assert data["subject"] == "Offert takbyte" and data["message_id"] == "101"
+    assert "120 000 kr" in data["body"] and data["body_truncated"] is False
+    assert data["read_status"] == "read"
+    short = json.loads(mail_index.read_email(101, output_format="json", max_chars=5))
+    assert short["body"] == "Hej, " and short["body_truncated"] is True
+    for bad in (dict(message_id="7x"), dict(message_id="１２"), dict(message_id=101, max_chars=0),
+                dict(message_id=101, output_format="xml")):
+        assert mail_index.read_email(**bad).startswith("Error")

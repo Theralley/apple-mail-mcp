@@ -585,6 +585,7 @@ def test_email_thread(mail_db):
         "✉ Budget?",
         "   From: Alice <alice@example.com>",
         f"   Date: {date_of(-100)}",
+        "   Mailbox: Inbox",
         "   Preview: body of 101",
     ])
     everywhere = search.get_email_thread(account="Work", subject_keyword="Budget", mailbox="All")

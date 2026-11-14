@@ -7,6 +7,7 @@ import threading
 import time
 
 import apple_mail_mcp.server as server
+from apple_mail_mcp import paths
 
 
 # Workaround for modelcontextprotocol/python-sdk#526.
@@ -35,6 +36,19 @@ def _start_orphan_watcher(
     threading.Thread(target=_watch, daemon=True).start()
 
 
+def _remove_tool(mcp, name: str) -> None:
+    """Unregister a tool by name, ignoring names that were never registered.
+
+    Goes through the server's local provider rather than FastMCP.remove_tool:
+    the latter is deprecated in fastmcp 3.x and gone in 4.x, while
+    local_provider.remove_tool exists (and raises KeyError on a miss) in both.
+    """
+    try:
+        mcp.local_provider.remove_tool(name)
+    except KeyError:
+        pass
+
+
 def main():
     _start_orphan_watcher()
 
@@ -42,11 +56,30 @@ def main():
     parser.add_argument(
         "--read-only",
         action="store_true",
-        help="Only read mail, save attachments/exports locally, sync, and "
-             "create or list drafts. Every other tool is removed.",
+        help="Only read mail, save attachments/exports locally, sync, mark "
+             "messages read/unread by ID, and create, list or delete drafts. "
+             "Every other tool is removed.",
+    )
+    parser.add_argument(
+        "--write-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Only allow file-writing tools to write inside DIR (repeatable). "
+             "Adds to APPLE_MAIL_MCP_WRITE_DIRS. Default: anywhere except "
+             "protected locations.",
+    )
+    parser.add_argument(
+        "--attach-dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Only allow attaching files from inside DIR (repeatable). "
+             "Adds to APPLE_MAIL_MCP_ATTACH_DIRS. Default: any file except secrets.",
     )
     args = parser.parse_args()
 
+    paths.configure(write_dirs=args.write_dir, attach_dirs=args.attach_dir)
     configure(read_only=args.read_only)
 
     from apple_mail_mcp import mcp  # noqa: E402
@@ -64,7 +97,7 @@ def configure(read_only: bool) -> None:
 
     for tool in asyncio.run(mcp.list_tools()):
         if tool.name not in server.READ_ONLY_ALLOWED_TOOLS:
-            mcp.remove_tool(tool.name)
+            _remove_tool(mcp, tool.name)
 
 
 if __name__ == "__main__":

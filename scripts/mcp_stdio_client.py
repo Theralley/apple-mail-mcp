@@ -9,7 +9,7 @@ only their size and an error flag are reported. Use --show to print them.
 Examples:
     # Startup + tools/list timing for the published package
     python3 scripts/mcp_stdio_client.py -- uvx --from mcp-apple-mail \
-        --with 'mcp<2' mcp-apple-mail --read-only
+        mcp-apple-mail --read-only
 
     # Call tools against the local checkout
     python3 scripts/mcp_stdio_client.py \

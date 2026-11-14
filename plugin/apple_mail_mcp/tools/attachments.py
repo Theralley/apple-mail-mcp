@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from mcp.server.fastmcp import Image
+from fastmcp.utilities.types import Image
 
 from apple_mail_mcp import mail_attachments as ma
 from apple_mail_mcp.core import inject_preferences
@@ -11,7 +11,7 @@ from apple_mail_mcp.server import mcp
 MAX_ATTACHMENT_READ_BYTES = 40 * 1024 * 1024
 
 
-@mcp.tool(structured_output=False)
+@mcp.tool(output_schema=None)
 @inject_preferences
 def read_email_attachment(
     message_id: int,

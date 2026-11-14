@@ -133,7 +133,7 @@ def test_text_helpers():
 
 def test_read_tool_returns_the_picture_and_pdf_text(store, monkeypatch):
     from apple_mail_mcp.tools import attachments
-    from mcp.server.fastmcp import Image
+    from fastmcp.utilities.types import Image
 
     out = attachments.read_email_attachment(321, part="1.2")
     assert isinstance(out, list) and isinstance(out[1], Image)
@@ -197,7 +197,8 @@ def test_protected_folders_ignore_case(store, home):
     with pytest.raises(draft_mime.DraftError, match="protected"):
         draft_mime.load_attachments(str(home / ".CoNfIg" / "token.json"))
     out = manage.save_email_attachment(message_id=321, part="2", save_path=str(home / ".SSH" / "x.pdf"))
-    assert "sensitive directory" in out
+    # Refused by the shared path guard (upstream wording) or by this tool's own check.
+    assert out.startswith("Error") and ("protected location" in out or "sensitive directory" in out)
 
 
 def test_same_named_parts_are_never_fetched_by_name(tmp_path, monkeypatch):

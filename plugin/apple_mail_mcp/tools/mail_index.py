@@ -1,7 +1,9 @@
 """A local search index of all mail, read/unread state, and reading a message by id, on this Mac only."""
 
+import json
 import sqlite3
 from datetime import datetime
+from email.utils import getaddresses
 from typing import List, Optional, Union
 
 from apple_mail_mcp import emlx
@@ -229,27 +231,43 @@ def _read_state(message_id: int) -> Optional[str]:
 
 @mcp.tool()
 @inject_preferences
-def read_email(message_id: int, max_chars: int = 20000, include_headers: bool = False) -> str:
+def read_email(
+    message_id: Union[int, str],
+    max_chars: int = 20000,
+    include_headers: bool = False,
+    output_format: str = "text",
+    account: Optional[str] = None,
+    mailbox: Optional[str] = None,
+) -> str:
     """
     Read one email by its message ID, from Mail's files on this Mac.
 
-    Fast and local: no mailbox search. Gives sender, recipients, date,
-    subject, the body as text and the attachments (with part numbers for
-    read_email_attachment / save_email_attachment). Get the ID from
-    search_mail_index or any listing tool.
+    Fast and local: no mailbox search, and Mail is not asked for the body
+    (Mail's own HTML conversion is what made it hang). Gives sender,
+    recipients, date, subject, read/unread state, the body as text and the
+    attachments (with part numbers for read_email_attachment /
+    save_email_attachment). Reading here never marks the message read. Get
+    the ID from search_mail_index, search_emails or any listing tool.
 
     Args:
-        message_id: Mail's message ID
+        message_id: Mail's numeric message ID (not the Message-ID header)
         max_chars: Maximum body characters returned (default 20000)
-        include_headers: Also list every header
+        include_headers: Also list every header (text output)
+        output_format: "text" (default) or "json"
+        account: Optional; accepted for compatibility, the ID alone finds the message
+        mailbox: Optional; accepted for compatibility, the ID alone finds the message
 
     Returns:
-        The message as text
+        The message as text, or as a JSON object
     """
-    try:
-        message_id = int(str(message_id).strip())
-    except ValueError:
-        return f"Error: message_id must be a number, got {message_id!r}"
+    text_id = str(message_id).strip()
+    if not text_id.isascii() or not text_id.isdigit():
+        return "Error: message_id must contain only digits"
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+        return "Error: max_chars must be a positive integer"
+    if output_format not in ("text", "json"):
+        return "Error: output_format must be text or json"
+    message_id = int(text_id)
     msg = emlx.get_message(message_id, allow_fallback=False)
     path = emlx.find_message_file(message_id)
     if msg is None and path is not None:
@@ -262,16 +280,6 @@ def read_email(message_id: int, max_chars: int = 20000, include_headers: bool = 
             f"Error: message {message_id} is not on disk (not downloaded yet, deleted, or no Full Disk "
             "Access). Open it in Mail once, or use search_emails / get_email_source."
         )
-    lines = [f"EMAIL {message_id}", ""]
-    for header in ("From", "To", "Cc", "Date", "Subject"):
-        if msg.get(header):
-            lines.append(f"{header}: {' '.join(str(msg.get(header)).split())}")
-    state = _read_state(message_id)
-    if state is not None:
-        lines.append(f"Status: {state} (reading it here does not change that)")
-    if include_headers:
-        lines.append("")
-        lines.extend(f"{k}: {' '.join(str(v).split())[:500]}" for k, v in msg.items())
     try:
         body = emlx.body_text(msg)
     except (ValueError, LookupError):
@@ -280,6 +288,46 @@ def read_email(message_id: int, max_chars: int = 20000, include_headers: bool = 
         parts = ma.list_parts(message_id)
     except ma.AttachmentError:
         parts = []
+    state = _read_state(message_id)
+    text = (body or "").strip()
+
+    if output_format == "json":
+        def header(name):
+            return " ".join(str(msg.get(name) or "").split())
+
+        def addresses(name):
+            return [addr for _, addr in getaddresses([str(v) for v in msg.get_all(name, [])]) if addr]
+
+        return json.dumps({
+            "subject": header("Subject"),
+            "sender": header("From"),
+            "date_received": header("Date"),
+            "message_id": str(message_id),
+            "internet_message_id": header("Message-ID"),
+            "to": addresses("To"),
+            "cc": addresses("Cc"),
+            "attachments": [
+                {"name": item.filename, "mime_type": item.content_type or None, "file_size": item.size,
+                 "part": item.part, "inline_picture": item.is_inline_picture,
+                 "downloaded": item.source != "missing"}
+                for item in parts
+            ],
+            "read_status": state,
+            "body": text[:max_chars] if body is not None else None,
+            "body_truncated": body is not None and len(text) > max_chars,
+            "body_total_chars": len(text) if body is not None else None,
+            "body_downloaded": body is not None,
+        }, ensure_ascii=False)
+
+    lines = [f"EMAIL {message_id}", ""]
+    for name in ("From", "To", "Cc", "Date", "Subject"):
+        if msg.get(name):
+            lines.append(f"{name}: {' '.join(str(msg.get(name)).split())}")
+    if state is not None:
+        lines.append(f"Status: {state} (reading it here does not change that)")
+    if include_headers:
+        lines.append("")
+        lines.extend(f"{k}: {' '.join(str(v).split())[:500]}" for k, v in msg.items())
     if parts:
         lines.append("")
         lines.append("Attachments:")
@@ -291,8 +339,7 @@ def read_email(message_id: int, max_chars: int = 20000, include_headers: bool = 
     if body is None:
         lines.append("(The body is not downloaded yet; open the message in Mail once.)")
     else:
-        text = body.strip()
-        if max_chars and len(text) > max_chars:
+        if len(text) > max_chars:
             text = text[:max_chars] + f"\n\n[... cut at {max_chars} characters]"
         lines.append(text or "(empty body)")
     return "\n".join(lines)

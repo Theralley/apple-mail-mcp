@@ -1,6 +1,7 @@
 """Search tools: finding and filtering emails."""
 
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -16,6 +17,7 @@ from apple_mail_mcp.core import (
     AS_RECORD_SEP,
     FIELD_SEP,
     RECORD_SEP,
+    build_mailbox_ref,
     clean_script_output,
     contains_any_condition,
     inject_preferences,
@@ -30,9 +32,11 @@ from apple_mail_mcp.emlx import (
     body_text as message_body_text,
     body_token_script,
     fill_body_tokens,
+    find_message_file,
     get_message,
     get_message_body,
     new_body_nonce,
+    parse_emlx,
     preview,
 )
 
@@ -321,17 +325,10 @@ def _search_mail_records(
                         if mailboxName is in {""" + skip_names + """} then set shouldSkip to true
         """
     else:
-        escaped_mailbox = escape_applescript(mailbox)
+        # Same resolution as every other tool: nested "A/B" names and the
+        # localized inbox names (upstream 937cf64).
         mailbox_script = f'''
-                try
-                    set searchMailbox to mailbox "{escaped_mailbox}" of targetAccount
-                on error
-                    if "{escaped_mailbox}" is "INBOX" then
-                        set searchMailbox to mailbox "Inbox" of targetAccount
-                    else
-                        error "Mailbox not found: {escaped_mailbox}"
-                    end if
-                end try
+                {build_mailbox_ref(mailbox, var_name="searchMailbox")}
                 set searchMailboxes to {{searchMailbox}}
         '''
         skip_script = ""
@@ -848,34 +845,137 @@ def search_emails(
         return f"Error: {exc}"
 
 
+_THREAD_PREFIX_RE = re.compile(r"^\s*(re|aw|fwd|fw|wg|sv|vs)\s*(\[\d+\])?\s*:\s*", re.IGNORECASE)
+_MESSAGE_ID_RE = re.compile(r"<([^<>@\s]+@[^<>\s]+)>")
+_REFERENCE_HEADER_RE = re.compile(
+    r"^(?:references|in-reply-to)\s*:(.*?)(?=^\S|\Z)",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+THREAD_RULE = "━" * 40
+
+
+def _strip_thread_prefixes(subject: str) -> str:
+    """Strip repeated Re:/AW:/Fwd:/WG:/SV: prefixes from a subject."""
+    cleaned = (subject or "").strip()
+    while True:
+        stripped = _THREAD_PREFIX_RE.sub("", cleaned, count=1)
+        if stripped == cleaned:
+            return cleaned.strip()
+        cleaned = stripped.strip()
+
+
+def _referenced_ids(headers: str) -> set:
+    """Return every Message-ID referenced by In-Reply-To / References."""
+    found = set()
+    for block in _REFERENCE_HEADER_RE.findall(headers or ""):
+        found.update(_MESSAGE_ID_RE.findall(block))
+    return found
+
+
+def _split_thread_by_linkage(records: List[Dict[str, Any]]):
+    """Split candidates into the real thread and same-subject strangers.
+
+    The newest candidate seeds the thread; everything reachable from it
+    through Message-ID references belongs to it. A message without any
+    Message-ID at all stays in the thread, since dropping it would hide mail
+    that the old subject-only grouping did show. (From upstream 695486a.)
+    """
+    if not records:
+        return [], []
+
+    # The seed must be the newest message, or the thread grows from the wrong end.
+    records = sorted(records, key=lambda record: record["age_seconds"])
+    seed = records[-1]
+    thread_ids = set()
+    if seed["message_id"]:
+        thread_ids.add(seed["message_id"])
+    thread_ids.update(seed["references"])
+
+    # Repeat until nothing new joins: a reply can reference a message that
+    # itself only joins the thread later in the list.
+    linked = [seed]
+    remaining = [record for record in records if record is not seed]
+    changed = True
+    while changed:
+        changed = False
+        for record in list(remaining):
+            own_id = record["message_id"]
+            if (own_id and own_id in thread_ids) or (record["references"] & thread_ids):
+                linked.append(record)
+                remaining.remove(record)
+                if own_id:
+                    thread_ids.add(own_id)
+                thread_ids.update(record["references"])
+                changed = True
+
+    for record in list(remaining):
+        if not record["message_id"] and not record["references"]:
+            linked.append(record)
+            remaining.remove(record)
+
+    linked.sort(key=lambda record: record["age_seconds"])
+    remaining.sort(key=lambda record: record["age_seconds"])
+    return linked, remaining
+
+
+def _format_thread_record(record: Dict[str, Any]) -> List[str]:
+    indicator = "✓" if record["read"] else "✉"
+    lines = [
+        f"{indicator} {record['subject']}",
+        f"   From: {record['sender']}",
+        f"   Date: {record['date']}",
+    ]
+    if record["mailbox"]:
+        lines.append(f"   Mailbox: {record['mailbox']}")
+    if record["preview"]:
+        lines.append(f"   Preview: {record['preview']}")
+    lines.append("")
+    return lines
+
+
+def _format_thread_view(keyword: str, account: str, linked, unlinked) -> str:
+    lines = [
+        "EMAIL THREAD VIEW", "", f"Thread topic: {keyword}", f"Account: {account}", "",
+        THREAD_RULE, f"FOUND {len(linked)} MESSAGE(S) IN THREAD", THREAD_RULE, "",
+    ]
+    for record in linked:
+        lines.extend(_format_thread_record(record))
+    if unlinked:
+        lines += [THREAD_RULE, f"{len(unlinked)} MESSAGE(S) WITH THE SAME SUBJECT BUT NO LINK TO THIS THREAD",
+                  THREAD_RULE, ""]
+        for record in unlinked:
+            lines.extend(_format_thread_record(record))
+    return "\n".join(lines).rstrip() + "\n"
+
+
 @mcp.tool()
 @inject_preferences
 def get_email_thread(
     account: str, subject_keyword: str, mailbox: str = "INBOX", max_messages: int = 50
 ) -> str:
     """
-    Get an email conversation thread - all messages with the same or similar subject.
+    Get an email conversation thread - messages linked by Message-ID, not just by subject.
+
+    Candidates are found by subject, then linked through their Message-ID /
+    In-Reply-To / References headers (read from Mail's files on disk).
+    Messages that merely share the subject but belong to a different
+    conversation are listed separately instead of being mixed into the thread.
 
     Args:
         account: Account name (e.g., "Gmail", "Work")
         subject_keyword: Keyword to identify the thread (e.g., "Re: Project Update")
         mailbox: Mailbox to search in (default: "INBOX", use "All" for all mailboxes)
-        max_messages: Maximum number of thread messages to return (default: 50)
+        max_messages: Maximum number of candidate messages to inspect (default: 50).
+            The cap applies before linking, so the thread is seeded from the
+            newest of those candidates. Raise it for long-running subjects.
 
     Returns:
-        Formatted thread view with all related messages sorted by date
+        Formatted thread view sorted oldest first, with unlinked same-subject
+        messages called out separately
     """
-
-    # Escape user inputs for AppleScript
-    escaped_account = escape_applescript(account)
-    escaped_mailbox = escape_applescript(mailbox)
-
-    # For thread detection, we'll strip common prefixes
-    thread_keywords = ["Re:", "Fwd:", "FW:", "RE:", "Fw:"]
-    cleaned_keyword = subject_keyword
-    for prefix in thread_keywords:
-        cleaned_keyword = cleaned_keyword.replace(prefix, "").strip()
-    escaped_keyword = escape_applescript(cleaned_keyword)
+    cleaned_keyword = _strip_thread_prefixes(subject_keyword)
+    if not cleaned_keyword:
+        return "Error: 'subject_keyword' is empty after stripping Re:/Fwd: prefixes"
     nonce = new_body_nonce()
 
     try:
@@ -883,115 +983,117 @@ def get_email_thread(
     except IndexUnavailable:
         pass
 
-    mailbox_script = f'''
-        try
-            set searchMailbox to mailbox "{escaped_mailbox}" of targetAccount
-        on error
-            if "{escaped_mailbox}" is "INBOX" then
-                set searchMailbox to mailbox "Inbox" of targetAccount
-            else if "{escaped_mailbox}" is "All" then
-                set searchMailboxes to every mailbox of targetAccount
-                set useAllMailboxes to true
-            else
-                error "Mailbox not found: {escaped_mailbox}"
-            end if
-        end try
+    records, error = _collect_thread_candidates(account, mailbox, cleaned_keyword, max_messages, nonce)
+    if error:
+        return error
+    if not records:
+        return (
+            f"EMAIL THREAD VIEW\n\nThread topic: {cleaned_keyword}\n"
+            f"Account: {account}\n\nNo message found matching: {subject_keyword} "
+            f"(searched mailbox: {mailbox})"
+        )
+    linked, unlinked = _split_thread_by_linkage(records)
+    return fill_body_tokens(_format_thread_view(cleaned_keyword, account, linked, unlinked), 150, nonce, missing=None)
 
-        if "{escaped_mailbox}" is not "All" then
-            set searchMailboxes to {{searchMailbox}}
-            set useAllMailboxes to false
-        end if
-    '''
+
+def _collect_thread_candidates(account: str, mailbox: str, cleaned_keyword: str, max_messages: int, nonce: str):
+    """(records, error) from Mail for messages whose subject carries the keyword.
+
+    Only used when Mail's database cannot be read. Never asks Mail for a
+    body: the preview is a token filled from the message file on disk.
+    """
+    separator = "<<<AMMCP-" + os.urandom(8).hex() + ">>>"
+    row_separator = "<<<AMMCPROW-" + os.urandom(8).hex() + ">>>"
+    safe_account = escape_applescript(account)
+    safe_keyword = escape_applescript(cleaned_keyword)
+
+    if mailbox == "All":
+        mailbox_setup = "set searchMailboxes to every mailbox of targetAccount"
+    else:
+        mailbox_setup = f"""{build_mailbox_ref(mailbox, var_name="searchMailbox")}
+                set searchMailboxes to {{searchMailbox}}"""
+    preview_token = body_token_script(nonce, "aMessage", f'"{safe_account}"', "(name of currentMailbox)")
 
     script = f'''
     tell application "Mail"
-        set outputText to "EMAIL THREAD VIEW" & return & return
-        set outputText to outputText & "Thread topic: {escaped_keyword}" & return
-        set outputText to outputText & "Account: {escaped_account}" & return & return
-        set threadMessages to {{}}
+        with timeout of 300 seconds
+            try
+                set targetAccount to account "{safe_account}"
+                {mailbox_setup}
 
-        try
-            set targetAccount to account "{escaped_account}"
-            {mailbox_script}
+                set collected to 0
+                set outputText to ""
 
-            -- Collect all matching messages from all mailboxes. Stripping a
-            -- Re:/Fwd: prefix only shortens the subject, so a subject matches
-            -- exactly when it contains the keyword: let Mail filter with a
-            -- whose clause instead of reading every subject one event at a time.
-            repeat with currentMailbox in searchMailboxes
-                if (count of threadMessages) >= {max_messages} then exit repeat
-                set mailboxMessages to (every message of currentMailbox whose subject contains "{escaped_keyword}")
-
-                repeat with aMessage in mailboxMessages
-                    if (count of threadMessages) >= {max_messages} then exit repeat
-
+                repeat with currentMailbox in searchMailboxes
+                    if collected >= {int(max_messages)} then exit repeat
                     try
-                        set messageSubject to subject of aMessage
-
-                        -- Remove common prefixes for matching
-                        set cleanSubject to messageSubject
-                        if cleanSubject starts with "Re: " then
-                            set cleanSubject to text 5 thru -1 of cleanSubject
-                        end if
-                        if cleanSubject starts with "RE: " then
-                            set cleanSubject to text 5 thru -1 of cleanSubject
-                        end if
-                        if cleanSubject starts with "Fwd: " then
-                            set cleanSubject to text 6 thru -1 of cleanSubject
-                        else if cleanSubject starts with "FW: " then
-                            set cleanSubject to text 5 thru -1 of cleanSubject
-                        else if cleanSubject starts with "Fw: " then
-                            set cleanSubject to text 5 thru -1 of cleanSubject
-                        end if
-
-                        -- Check if this message is part of the thread
-                        if cleanSubject contains "{escaped_keyword}" or messageSubject contains "{escaped_keyword}" then
-                            set end of threadMessages to aMessage
-                        end if
+                        -- `whose` filters inside Mail; walking every message
+                        -- over Apple Events takes minutes on a big archive.
+                        set candidates to (every message of currentMailbox whose subject contains "{safe_keyword}")
+                        repeat with aMessage in candidates
+                            if collected >= {int(max_messages)} then exit repeat
+                            try
+                                set headerText to ""
+                                try
+                                    set headerText to all headers of aMessage
+                                end try
+                                set messageIdText to ""
+                                try
+                                    set messageIdText to message id of aMessage
+                                end try
+                                set outputText to outputText & messageIdText & "{separator}" & ¬
+                                    (subject of aMessage) & "{separator}" & ¬
+                                    (sender of aMessage) & "{separator}" & ¬
+                                    ((date received of aMessage) as string) & "{separator}" & ¬
+                                    (((date received of aMessage) - (current date)) as text) & "{separator}" & ¬
+                                    ((read status of aMessage) as text) & "{separator}" & ¬
+                                    (name of currentMailbox) & "{separator}" & ¬
+                                    {preview_token} & "{separator}" & ¬
+                                    headerText & "{row_separator}"
+                                set collected to collected + 1
+                            end try
+                        end repeat
                     end try
                 end repeat
-            end repeat
 
-            -- Display thread messages
-            set messageCount to count of threadMessages
-            set outputText to outputText & "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501" & return
-            set outputText to outputText & "FOUND " & messageCount & " MESSAGE(S) IN THREAD" & return
-            set outputText to outputText & "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501" & return & return
-
-            repeat with aMessage in threadMessages
-                try
-                    set messageSubject to subject of aMessage
-                    set messageSender to sender of aMessage
-                    set messageDate to date received of aMessage
-                    set messageRead to read status of aMessage
-
-                    if messageRead then
-                        set readIndicator to "\u2713"
-                    else
-                        set readIndicator to "\u2709"
-                    end if
-
-                    set outputText to outputText & readIndicator & " " & messageSubject & return
-                    set outputText to outputText & "   From: " & messageSender & return
-                    set outputText to outputText & "   Date: " & (messageDate as string) & return
-
-                    -- Body preview: filled in from disk after the script (emlx.py)
-                    set outputText to outputText & "   Preview: " & {body_token_script(nonce, "aMessage", '"' + escaped_account + '"', '"' + escaped_mailbox + '"')} & return
-
-                    set outputText to outputText & return
-                end try
-            end repeat
-
-        on error errMsg
-            return "Error: " & errMsg
-        end try
-
-        return outputText
+                return outputText
+            on error errMsg
+                return "ERROR{separator}" & errMsg
+            end try
+        end timeout
     end tell
     '''
 
-    result = run_applescript(script)
-    return fill_body_tokens(result, 150, nonce, missing=None)
+    raw = run_applescript(script, timeout=300) or ""
+    if raw.startswith("ERROR" + separator):
+        return [], "Error: " + raw.split(separator, 1)[1].strip()
+
+    records = []
+    for row in raw.split(row_separator):
+        if not row.strip():
+            continue
+        parts = row.split(separator)
+        if len(parts) < 9:
+            continue
+        try:
+            age_seconds = int(float(parts[4].strip()))
+        except ValueError:
+            age_seconds = 0
+        records.append(
+            {
+                "message_id": parts[0].strip().strip("<>"),
+                "subject": parts[1].strip(),
+                "sender": parts[2].strip(),
+                "date": parts[3].strip(),
+                "age_seconds": age_seconds,
+                "read": parts[5].strip().lower() == "true",
+                "mailbox": parts[6].strip(),
+                "preview": parts[7].strip(),
+                "references": _referenced_ids(separator.join(parts[8:])),
+            }
+        )
+    records.sort(key=lambda record: record["age_seconds"])
+    return records, None
 
 
 # ---------------------------------------------------------------------------
@@ -1123,11 +1225,21 @@ def _search_records_from_index(
     return _parse_search_records(clean_script_output(RECORD_SEP.join(lines))), incomplete, body_texts
 
 
-THREAD_RULE = "\u2501" * 40
+def _thread_references(message_id: int) -> set:
+    """Message-IDs in the In-Reply-To / References headers of a message on disk."""
+    path = find_message_file(message_id)
+    if path is None:
+        return set()
+    try:
+        msg = parse_emlx(path.read_bytes())
+    except (OSError, ValueError):
+        return set()
+    text = "".join(f"{name}: {value}\n" for name in ("In-Reply-To", "References") for value in msg.get_all(name, []))
+    return _referenced_ids(text)
 
 
 def _email_thread_from_index(account, mailbox, keyword, max_messages, nonce) -> str:
-    """get_email_thread's report from the index (the script's collection order)."""
+    """get_email_thread's report from Mail's database and message files."""
     if not keyword:
         raise IndexUnavailable("empty keyword")
     index = envelope_index.get_index()
@@ -1145,20 +1257,37 @@ def _email_thread_from_index(account, mailbox, keyword, max_messages, nonce) -> 
     else:
         raise IndexUnavailable(f"mailbox {mailbox!r} not in the index")
 
-    thread = []
+    found = []
+    seen = set()
     for box in boxes:
-        if len(thread) >= max_messages:
+        if len(found) >= max_messages:
             break
-        thread += index.messages([box.id], subject_contains_any=[keyword], limit=max_messages - len(thread))
+        for message in index.messages([box.id], subject_contains_any=[keyword], limit=max_messages - len(found)):
+            if message.id not in seen:
+                seen.add(message.id)
+                found.append((message, box.name))
+    if not found:
+        return clean_script_output(
+            f"EMAIL THREAD VIEW\n\nThread topic: {keyword}\nAccount: {account}\n\n"
+            f"No message found matching: {keyword} (searched mailbox: {mailbox})"
+        )
 
-    dates = envelope_index.date_strings(m.date_received for m in thread)
-    out = f"EMAIL THREAD VIEW\n\nThread topic: {keyword}\nAccount: {account}\n\n"
-    out += f"{THREAD_RULE}\nFOUND {len(thread)} MESSAGE(S) IN THREAD\n{THREAD_RULE}\n\n"
-    for message in thread:
-        indicator = "\u2713" if message.read else "\u2709"
-        out += f"{indicator} {message.subject}\n"
-        out += f"   From: {message.sender}\n"
-        out += f"   Date: {dates[message.date_received]}\n"
-        out += f"   Preview: \u27e6body:{nonce}:{message.id}|{account}|{mailbox}\u27e7\n"
-        out += "\n"
+    now = time.time()
+    dates = envelope_index.date_strings(m.date_received for m, _ in found)
+    records = [
+        {
+            "message_id": message.internet_message_id,
+            "references": _thread_references(message.id),
+            "age_seconds": int(message.date_received - now),
+            "subject": message.subject,
+            "sender": message.sender,
+            "date": dates[message.date_received],
+            "read": message.read,
+            "mailbox": box_name,
+            "preview": f"\u27e6body:{nonce}:{message.id}|{account}|{box_name}\u27e7",
+        }
+        for message, box_name in found
+    ]
+    linked, unlinked = _split_thread_by_linkage(records)
+    out = _format_thread_view(keyword, account, linked, unlinked)
     return fill_body_tokens(clean_script_output(out), 150, nonce, missing=None)

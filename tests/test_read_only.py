@@ -193,3 +193,29 @@ def test_delete_with_no_match_or_a_lookup_error_deletes_nothing(read_only_flag):
     assert result == "Error: no such account"
     run.assert_called_once()
 
+
+# ---- tool removal (upstream's regression tests for _remove_tool) ------------
+
+def _tool_names(app) -> set:
+    return {t.name for t in asyncio.run(app.list_tools())}
+
+
+def test_remove_tool_removes_a_registered_tool_and_ignores_unknown_names():
+    from fastmcp import FastMCP
+
+    from apple_mail_mcp.__main__ import _remove_tool
+
+    app = FastMCP("test")
+
+    @app.tool
+    def send_it() -> str:
+        return "sent"
+
+    @app.tool
+    def read_it() -> str:
+        return "read"
+
+    _remove_tool(app, "does_not_exist")
+    assert _tool_names(app) == {"send_it", "read_it"}
+    _remove_tool(app, "send_it")
+    assert _tool_names(app) == {"read_it"}

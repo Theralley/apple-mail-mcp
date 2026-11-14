@@ -1,11 +1,12 @@
 """Analytics tools: attachments, statistics, exports, and dashboard."""
 
 import os
-from typing import Optional, List, Dict, Any, NamedTuple, Tuple
+from typing import Optional, List, Dict, Any, NamedTuple, Tuple, Union
 
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp import envelope_index
 from apple_mail_mcp.envelope_index import IndexUnavailable, fold
+from apple_mail_mcp.paths import validate_write_path
 from apple_mail_mcp.core import (
     AS_FIELD_SEP,
     AS_RECORD_SEP,
@@ -27,7 +28,8 @@ def list_email_attachments(
     account: Optional[str] = None,
     subject_keyword: Optional[str] = None,
     max_results: int = 1,
-    message_id: Optional[int] = None,
+    message_id: Optional[Union[int, str]] = None,
+    mailbox: Optional[str] = None,
 ) -> str:
     """
     List the attachments and inline pictures of an email.
@@ -45,12 +47,16 @@ def list_email_attachments(
         subject_keyword: Keyword in the subject; needed without message_id
         max_results: Maximum number of matching emails to check (default: 1)
         message_id: Mail's message ID; when given, account and subject are ignored
+        mailbox: Accepted for compatibility; a message ID is found in any mailbox
 
     Returns:
         List of attachments with part number, name, type and size
     """
     if message_id is not None:
-        return _list_attachments_by_id(message_id)
+        text = str(message_id).strip()
+        if not text.isascii() or not text.isdigit():
+            return "Error: message_id must contain digits only"
+        return _list_attachments_by_id(int(text))
     if not account or not subject_keyword:
         return "Error: pass message_id, or account and subject_keyword"
     return _list_attachments_by_subject(account, subject_keyword, max_results)
@@ -80,6 +86,7 @@ def _list_attachments_by_id(message_id) -> str:
 
 
 def _list_attachments_by_subject(account: str, subject_keyword: str, max_results: int) -> str:
+
 
     # Escape for AppleScript
     escaped_keyword = escape_applescript(subject_keyword)
@@ -362,7 +369,9 @@ def export_emails(
         scope: Export scope: "single_email" (requires subject_keyword) or "entire_mailbox"
         subject_keyword: Keyword to find email (required for single_email)
         mailbox: Mailbox to export from (default: "INBOX")
-        save_directory: Directory to save exports (default: "~/Desktop")
+        save_directory: Directory to save exports (default: "~/Desktop"). Protected
+            locations (dot-folders in ~, LaunchAgents, ~/Library/Application Support,
+            ...) are rejected.
         format: Export format: "txt", "html" (default: "txt")
         max_emails: Maximum number of emails to export for entire_mailbox (default: 1000, safety cap)
 
@@ -370,33 +379,10 @@ def export_emails(
         Confirmation message with export location
     """
 
-    # Expand home directory
-    save_dir = os.path.expanduser(save_directory)
-
-    # Path validation: resolve to absolute path and enforce safety constraints
-    resolved_path = os.path.realpath(save_dir)
-    home_dir = os.path.expanduser('~')
-
-    # Must be under the user's home directory
-    if not resolved_path.startswith(home_dir + os.sep) and resolved_path != home_dir:
-        return f"Error: Save path must be under your home directory ({home_dir}). Got: {resolved_path}"
-
-    # Block sensitive directories
-    sensitive_dirs = [
-        os.path.join(home_dir, '.ssh'),
-        os.path.join(home_dir, '.gnupg'),
-        os.path.join(home_dir, '.config'),
-        os.path.join(home_dir, '.aws'),
-        os.path.join(home_dir, '.claude'),
-        os.path.join(home_dir, 'Library', 'LaunchAgents'),
-        os.path.join(home_dir, 'Library', 'LaunchDaemons'),
-        os.path.join(home_dir, 'Library', 'Keychains'),
-    ]
-    for sensitive_dir in sensitive_dirs:
-        if resolved_path.startswith(sensitive_dir + os.sep) or resolved_path == sensitive_dir:
-            return f"Error: Cannot export emails to sensitive directory: {sensitive_dir}"
-
-    save_dir = resolved_path
+    # Resolve the export directory and reject protected locations (#103)
+    save_dir, path_error = validate_write_path(save_directory)
+    if path_error:
+        return path_error
 
     # Escape all user inputs for AppleScript
     safe_account = escape_applescript(account)

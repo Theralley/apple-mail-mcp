@@ -70,6 +70,20 @@ claude mcp add apple-mail -- mcp-apple-mail
 </details>
 
 <details>
+<summary><strong>npx skills (skill only, for Claude Code, Codex, Cursor and other agents)</strong></summary>
+
+Installs the Email Management Expert skill via the open [skills CLI](https://skills.sh). The skill does not include the MCP server, so install that too (e.g. with uvx above):
+
+```bash
+npx skills add patrickfreyer/apple-mail-mcp
+claude mcp add apple-mail -- uvx mcp-apple-mail
+```
+
+Add `-g` to install the skill globally, or `-a <agent>` to target a specific agent.
+
+</details>
+
+<details>
 <summary><strong>Claude Desktop MCPB</strong></summary>
 
 1. Download the latest `apple-mail-mcp-vX.Y.Z.mcpb` from [Releases](https://github.com/patrickfreyer/apple-mail-mcp/releases)
@@ -92,7 +106,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 
 </details>
 
-## Tools (31)
+## Tools (32)
 
 ### Reading & Search
 | Tool | Description |
@@ -103,13 +117,16 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `list_accounts` | List all configured Mail accounts |
 | `search_emails` | Unified search — subject, sender, body text, dates, attachments, flag status/color, cross-account |
 | `get_email_thread` | Conversation thread view |
-| `read_email` | Read one email by its message ID from Mail's files (headers, body, attachment parts) |
+| `read_email` | Read one email by its message ID from Mail's files, in any mailbox: headers, body (capped by `max_chars`), attachment parts and read state; text or JSON |
+| `get_email_source` | Raw RFC 822 source of one message (all headers and MIME parts) |
+| `list_account_addresses` | Email addresses of each Mail account |
+| `synchronize_account` | Ask Mail to fetch new mail for one account or all of them now |
 
-### Local search index (Inbox and Sent)
+### Local search index (all mail)
 | Tool | Description |
 |------|-------------|
-| `index_mail` | Build or update a full-text index of Inbox and Sent on this Mac (newest first, resumable) |
-| `search_mail_index` | Search it in milliseconds: subject, people, attachment names and body text, with filters |
+| `index_mail` | Build or update a full-text index of all mail on this Mac, or only Inbox and Sent (newest first, resumable) |
+| `search_mail_index` | Search it in milliseconds: subject, people, attachment names and body text, with filters including read/unread |
 
 ### Organization
 | Tool | Description |
@@ -118,6 +135,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `create_mailbox` | Create new mailboxes (supports nested paths) |
 | `move_email` | Move/archive emails with filters (subject, sender, date, read status, dry-run) |
 | `update_email_status` | Mark read/unread, flag/unflag (optional flag color) — by filters or message IDs |
+| `set_email_read_status` | Mark given message IDs read or unread, confirmed in Mail's database (allowed under `--read-only`) |
 | `manage_trash` | Soft delete, permanent delete, empty trash (with dry-run) |
 
 ### Composition
@@ -154,16 +172,17 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 
 ### Read-Only Mode
 
-Pass `--read-only` to restrict the server to reading mail, saving attachments and creating, listing or deleting drafts. It is an allowlist: only these tools are registered, and any other tool, including one added in a future version, is removed at startup and refused at call time with a "blocked by --read-only" error.
+Pass `--read-only` to restrict the server to reading mail, saving attachments, creating, listing or deleting drafts, and marking mail read or unread by message ID. It is an allowlist: only these tools are registered, and any other tool, including one added in a future version, is removed at startup and refused at call time with a "blocked by --read-only" error.
 
 | Allowed under `--read-only` | Tools |
 |---|---|
 | Read | `list_accounts`, `list_account_addresses`, `list_mailboxes`, `list_inbox_emails`, `get_mailbox_unread_counts`, `get_inbox_overview`, `search_emails`, `get_email_thread`, `get_email_source`, `read_email`, `list_email_attachments`, `read_email_attachment`, `search_mail_index`, `get_statistics`, `get_top_senders`, `get_awaiting_reply`, `get_needs_response`, `inbox_dashboard` |
 | Write local files only | `save_email_attachment`, `export_emails`, `index_mail` (its own cache) |
 | Fetch new mail | `synchronize_account` |
+| Read state | `set_email_read_status`: marks the given message IDs read or unread (at most 50 per call), nothing else |
 | Drafts | `create_rich_email_draft`, `manage_drafts` with `action` `create`, `list` or `delete` only. `delete` removes one draft: it refuses when more than one draft matches `draft_subject` and lists them, so pass `draft_id` (shown by `list`) |
 
-Blocked: `compose_email`, `reply_to_email`, `forward_email`, `move_email`, `update_email_status`, `manage_trash` (every action), `create_mailbox`, and `manage_drafts` `send` and `open`.
+Blocked: `compose_email`, `reply_to_email`, `forward_email`, `move_email`, `update_email_status` (flags and filter-based marking), `manage_trash` (every action), `create_mailbox`, and `manage_drafts` `send` and `open`.
 
 #### How drafts are made
 
@@ -229,11 +248,47 @@ Mail often keeps a downloaded message as a `.partial.emlx` whose attachment part
 
 ### Local search index
 
-`index_mail` builds a full-text index of every account's Inbox and Sent from Mail's own database and message files: no AppleScript for bodies, nothing sent anywhere. It is stored in `~/Library/Caches/apple-mail-mcp/mail-index.sqlite3` (folder 0700, file 0600; `APPLE_MAIL_MCP_INDEX_PATH` moves it) and holds message text, so `index_mail(delete_index=True)` removes it. The newest mail is indexed first in batches, so a first run that hits its time budget (`max_seconds`, default 120) continues on the next run; later runs only add what is new, and `search_mail_index` tops it up by itself (a check costs about 10 ms when nothing is new; deletions and moves are picked up by a full comparison every 10 minutes).
+`index_mail` builds a full-text index of every account's mail from Mail's own database and message files: no AppleScript for bodies, nothing sent anywhere. By default it covers every mailbox (`scope="all"`: inbox, sent and every other folder; Gmail labels are respected, so a message is indexed once). `scope="inbox,sent"` or one folder narrows it, and later runs and searches keep that scope. It is stored in `~/Library/Caches/apple-mail-mcp/mail-index.sqlite3` (folder 0700, file 0600; `APPLE_MAIL_MCP_INDEX_PATH` moves it) and holds message text, so `index_mail(delete_index=True)` removes it. The newest mail is indexed first in batches, so a first run that hits its time budget (`max_seconds`, default 120) continues on the next run; later runs only add what is new, and `search_mail_index` tops it up by itself (a check costs about 10 ms when nothing is new; deletions and moves are picked up by a full comparison every 10 minutes).
 
-Measured on a Mac with five accounts: 48,226 Inbox and Sent messages indexed in about 2.5 minutes, about 280 MB on disk; searches take 2–40 ms, against 4–15 s per mailbox (up to 100 s across accounts) for Mail's own search through AppleScript.
+Measured on a Mac with five accounts: all 53,214 messages indexed in 173 s, 294 MB on disk; searches take 2–40 ms, against 4–15 s per mailbox (up to 100 s across accounts) for Mail's own search through AppleScript.
 
-Queries: words are ANDed and matched whole, case-insensitively; å, ä and ö are kept as letters of their own. `offer*` is a prefix, `"two words"` a phrase, and `subject:`, `from:`, `to:`, `attachment:` or `body:` limit a word to one field. Filters: `folder`, `account`, `sender`, `date_from`/`date_to`, `has_attachment`; `sort="relevance"` ranks by match instead of date.
+Queries: words are ANDed and matched whole, case-insensitively; å, ä and ö are kept as letters of their own. `offer*` is a prefix, `"two words"` a phrase, and `subject:`, `from:`, `to:`, `attachment:` or `body:` limit a word to one field. Filters: `folder` (`all`, `inbox`, `sent`, `both` or `other`), `mailbox`, `account`, `sender`, `date_from`/`date_to`, `has_attachment`, `read_status`; `sort="relevance"` ranks by match instead of date.
+
+### Read and unread
+
+`search_mail_index(read_status="unread")` returns only unread messages (`"read"` only read ones). The state is read live from Mail's database at search time, so a message marked in Mail shows up at once, and each hit shows `· unread`. `read_email` shows the state and does not change it. `set_email_read_status(message_ids=[...], read=True)` marks those messages read (or unread with `read=False`): one exact lookup per message, at most 50 per call, and each change is confirmed in Mail's database before it is reported.
+
+A task such as "go through the unread Railway update mails, fix each one and mark it read when it is done" then looks like this:
+
+1. `search_mail_index(query="railway", read_status="unread", folder="inbox")` lists the open ones, newest first, with their message IDs.
+2. `read_email(message_id=...)` (and `read_email_attachment` when needed) for each one.
+3. Do the work, then `set_email_read_status(message_ids=[...])` for exactly the messages whose task is done.
+
+### File Access
+
+By default the server can write and attach files anywhere your user account can, except a hardened denylist of locations an attacker could use for code execution or credential theft. (Attachment bytes come from whoever emailed you, and a prompt-injected email can steer tool arguments.)
+
+**Writes** (`save_email_attachment`, `export_emails`, `create_rich_email_draft`'s `output_path`) are refused for the locations below. In this fork `save_email_attachment` also only writes under your home folder, and `create_rich_email_draft`'s `output_path` must be an `.eml` under your home or a temp folder.
+
+Refused:
+
+- any dotfile or dot-folder directly in your home folder: shell startup files (`~/.zshrc`, `~/.zshenv`, `~/.zprofile`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.profile`), `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config` (incl. `~/.config/git`), `~/.gitconfig`, `~/.netrc`, `~/.envrc`, `~/.local/bin`, ...
+- `.git/hooks`, `.git/config` and `.envrc` in any folder
+- autostart, persistence and app-config folders: `~/Library/LaunchAgents`, `~/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`, `~/Library/Application Support` (incl. `com.apple.backgroundtaskmanagementagent`), `~/Library/Application Scripts`, `~/Library/Preferences`, `~/Library/Keychains`, `~/Library/Mail`, `~/Library/Containers`, ...
+- folders on `PATH`: `~/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, and `/etc`
+
+**Attachments** (`compose_email`, `reply_to_email`, ...) may be any readable file except secrets (drafts made by `manage_drafts` additionally take them only from your home or a temp folder, at most 10 files and 25 MB): `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `.env` files, `~/Library/Keychains`, and browser profiles and cookie stores (Safari, Chrome, Firefox, Edge, Brave, Arc, ...).
+
+Paths are resolved (`~`, `..`, symlinks) before checking, and matching is case-insensitive like APFS.
+
+**Restricting further (opt-in).** To confine writes or attachments to specific folders, list them (colon-separated) in the server's `env`, or pass `--write-dir` / `--attach-dir` (repeatable) as arguments. Once set, only those folders are allowed for that side, and the denylist still applies inside them. The tool's own cache (`~/Library/Caches/apple-mail-mcp`, the default rich-draft location) stays writable.
+
+```json
+"env": {
+  "APPLE_MAIL_MCP_WRITE_DIRS": "~/Downloads:~/Documents/mail-exports",
+  "APPLE_MAIL_MCP_ATTACH_DIRS": "~/Documents:~/Desktop"
+}
+```
 
 ## Usage Examples
 
@@ -259,7 +314,7 @@ This is more reliable than injecting raw HTML into AppleScript `content`, which 
 
 ## Email Management Skill
 
-A companion [Claude Code Skill](plugin/skills/email-management/) is included that teaches Claude expert email workflows (Inbox Zero, daily triage, folder organization). When installed as a plugin, the skill is loaded automatically. For standalone MCP installs, copy it manually:
+A companion [Claude Code Skill](plugin/skills/email-management/) is included that teaches Claude expert email workflows (Inbox Zero, daily triage, folder organization). When installed as a plugin, the skill is loaded automatically. For standalone MCP installs, add it with `npx skills add patrickfreyer/apple-mail-mcp` or copy it manually:
 
 ```bash
 cp -r plugin/skills/email-management ~/.claude/skills/email-management

@@ -8,22 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Local search index of Inbox and Sent: `index_mail` and
-  `search_mail_index`.** Searching through Mail with AppleScript took 4-15 s
-  per mailbox and up to 100 s (incomplete) across accounts. The index is
-  built from the Envelope Index and the `.emlx` files only (no AppleScript
-  for bodies), in SQLite FTS5 (`unicode61`, diacritics kept so å/ä/ö stay
-  letters of their own) at `~/Library/Caches/apple-mail-mcp/` (0700/0600;
-  `APPLE_MAIL_MCP_INDEX_PATH`). Newest first in committed batches within a
-  time budget, so a first run resumes; one writer at a time (flock), readers
-  never wait (WAL). Bodies not downloaded yet are counted and retried.
-  Searches top the index up first, for the scope it was built with, and skip
-  that in ~10 ms when Mail has no new message. Measured: 48,226 messages in
-  about 2.5 minutes, ~280 MB, searches 2-40 ms. Queries support prefixes,
-  phrases and `subject:`/`from:`/`to:`/`attachment:`/`body:`; every term is
-  quoted, so FTS5 syntax typed by a caller is never executed.
+- **Local search index of all mail: `index_mail` and `search_mail_index`.**
+  Searching through Mail with AppleScript took 4-15 s per mailbox and up to
+  100 s (incomplete) across accounts. The index is built from the Envelope
+  Index and the `.emlx` files only (no AppleScript for bodies), in SQLite
+  FTS5 (`unicode61`, diacritics kept so å/ä/ö stay letters of their own) at
+  `~/Library/Caches/apple-mail-mcp/` (0700/0600; `APPLE_MAIL_MCP_INDEX_PATH`).
+  `index_mail` covers every mailbox by default (`scope="all"`: inbox, sent
+  and every other folder, Gmail labels respected); `scope="inbox,sent"` or a
+  single folder narrows it, and later searches keep that scope. A message
+  that moves between mailboxes is updated in place. Newest first in
+  committed batches within a time budget, so a first run resumes; one writer
+  at a time (flock), readers never wait (WAL). Bodies not downloaded yet are
+  counted and retried. Searches top the index up first and skip that in
+  ~10 ms when Mail has no new message. Measured on one Mac: 53,214 messages
+  (all mailboxes) in 173 s, 294 MB; searches 2-40 ms. Queries support
+  prefixes, phrases and `subject:`/`from:`/`to:`/`attachment:`/`body:`;
+  every term is quoted, so FTS5 syntax typed by a caller is never executed.
+  `folder` filters to `inbox`, `sent`, `both` or `other`.
+- **Read and unread state in the index, and `set_email_read_status`.**
+  `search_mail_index(read_status="unread")` returns only unread messages
+  (and `"read"` only read ones), with the live state read from Mail's
+  database at search time, so marking a message in Mail shows up at once;
+  hits show `· unread`, and `mailbox=` narrows to one mailbox. `status`
+  reports the unread count in the inbox. `read_email` states whether a
+  message is read and does not change it. The new
+  `set_email_read_status(message_ids, read=True)` marks up to 50 messages
+  read or unread by message ID (one exact `id` lookup per message, no
+  `whose` scan), skips messages already in that state, and confirms each
+  change in Mail's database before reporting it. This makes a task like
+  "go through the unread Railway mails, fix each one and mark it read when
+  done" possible. It is the only state change allowed under `--read-only`;
+  flags, moves and deletes stay blocked.
 - **`read_email(message_id)`**: one message by id from Mail's files (headers,
-  body text, attachment parts), without searching a mailbox.
+  body text, attachment parts, read state), in any mailbox, without asking
+  Mail. Takes upstream's `max_chars`, `include_headers` and
+  `output_format="json"`; `account` and `mailbox` are accepted and ignored.
 - **`read_email_attachment`**: an attachment or inline picture as something a
   client can use. Pictures come back as images (HEIC/TIFF/oversized ones are
   converted to JPEG with `sips`), PDFs as text (PDFKit), text-like files as
@@ -116,7 +136,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and records with the ASCII unit and record separators instead of `|||` and
   line breaks.
 - **`--read-only` is now a strict allowlist:** read mail, save attachments,
-  export to local files, sync, and create or list drafts; nothing else.
+  export to local files, sync, create, list and delete drafts, and mark mail
+  read or unread by message ID; nothing else.
   Previously it only removed the three send tools, so moving, flagging,
   marking, trashing (including `empty_trash`), creating mailboxes, and
   deleting or opening drafts all still worked. Tools not on
@@ -175,6 +196,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--read-only` now also blocks `manage_drafts(action="send")`. The guard
   read a `READ_ONLY` value that was imported before `main()` set it, so it
   was always `False` and read-only mode still sent drafts.
+
+### Added (upstream)
+- `reply_to_email` takes an optional `mailbox` (default `"INBOX"`), so you can reply to a message that a filter delivered to, or that was moved into, another folder. Nested paths use `/`, e.g. `"ASF/Projects/Magpie/Private"`. If nothing matches, the error names the mailbox that was searched (#89, reported by @rbowen).
+
+### Changed (upstream)
+- Docs: the email-management skill and README now say `create_rich_email_draft` exports an unsent `.eml` preview that Mail opens in a read-only viewer, and point to `compose_email(body_html=..., mode="draft")` for a sendable HTML draft. The draft workflow reads the saved draft back before sending, sends only when the user authorizes it, and treats a leftover draft as no proof of a failed send (#144 by @YassineElbouchaibi). In this fork `create_rich_email_draft(save_as_draft=True)` also makes a real, sendable draft (see Fixed above).
+
+### Fixed (upstream)
+- `search_emails(mailbox="All")` now skips the system folders (Trash, Junk, Sent, Drafts, ...) correctly: the exclusion list compared a repeat reference instead of its value, so nothing was ever skipped (#141 by @YassineElbouchaibi). This fork had the same fix (`is in`, under Changed above).
+- `search_emails` and `get_email_thread` resolve a specific mailbox through the shared helper, so localized inbox names (e.g. "Boîte de réception", "Posteingang") and nested paths like `Archives/2026` work (#140 by @YassineElbouchaibi).
+
+
+### Merged from upstream (patrickfreyer/apple-mail-mcp, 3.2.1 → 3.3.0 and Unreleased)
+- Starts on `mcp` 2.x: `from fastmcp import FastMCP` (#97). The
+  `--with 'mcp<2'` workaround is no longer needed.
+- Path guard (`paths.py`, `--write-dir`, `--attach-dir`) now also covers this
+  fork's attachment saving, rich-draft output and `.eml` attachments.
+- `reply_to_email(mailbox=...)`, the clipboard restore fix, the reply
+  verification, `move_email`/`manage_trash` argument fixes and the localized
+  and nested mailbox lookup (#140) are taken as they are.
+- `get_email_thread` links messages by Message-ID / In-Reply-To /
+  References (upstream's thread split), reading the headers from Mail's
+  files; same-subject messages from another conversation are listed apart.
+- Not taken: upstream's `read_email(account, message_id, mailbox)` (it asks
+  Mail for `content of`, which this fork never does; this fork's
+  `read_email` takes the same arguments), the AppleScript by-ID attachment
+  lookups (this fork reads them from disk in any mailbox), and the bounded
+  `whose` scan for very large mailboxes (this fork reads Mail's database
+  instead). `--read-only` stays this fork's strict allowlist.
+
+## [3.3.0] - 2026-10-28
+
+### Added
+- `list_email_attachments` and `save_email_attachment` accept `message_id` (the id `search_emails` returns) and `mailbox`, looking the message up directly instead of by subject, so recurring subjects can't pick the wrong month (#128 by @proscar87).
+- `read_email(account, message_id, mailbox)` returns one message as headers, plain-text body and attachment list, looked up directly by the id `search_emails` returns, with the body capped at `max_chars` and the cut stated (#128 by @proscar87).
+
+### Security
+- The write-path denylist now also checks the path as requested, not only its
+  symlink target. A symlink inside a protected folder (e.g.
+  `/opt/homebrew/bin/python3`) resolves outside it, so writing through it was
+  allowed (#125 by @proscar87, follow-up to #103).
+- Hardened the file-path guard for file-writing tools (#103, follow-up to #19).
+  The old denylist missed shell startup files, so a prompt-injected
+  `save_email_attachment(save_path="~/.zshrc")` could plant an attacker-supplied
+  attachment that ran on the next shell. `save_email_attachment`,
+  `export_emails` and `create_rich_email_draft`'s `output_path` (previously
+  unchecked) now refuse every dotfile and dot-folder directly in `$HOME`
+  (`~/.zshrc`, `~/.ssh`, `~/.gitconfig`, `~/.config`, `~/.netrc`, ...),
+  `.git/hooks`, `.git/config` and `.envrc` anywhere, autostart and persistence
+  locations (`~/Library/LaunchAgents`, `/Library/LaunchDaemons`,
+  `~/Library/Application Support`, `~/Library/Preferences`, ...) and `PATH`
+  folders (`~/bin`, `/usr/local/bin`, `/opt/homebrew/bin`). Everything else
+  stays writable, including paths outside `$HOME` such as the temp dir.
+- Attachment paths for `compose_email` and `reply_to_email` may now be any
+  readable file (previously `$HOME` only) except secrets: `~/.ssh`, `~/.gnupg`,
+  `~/.aws`, `~/.netrc`, git/cloud credentials, `.env` files,
+  `~/Library/Keychains` and browser profiles and cookie stores.
+- New opt-in restriction: `APPLE_MAIL_MCP_WRITE_DIRS` and
+  `APPLE_MAIL_MCP_ATTACH_DIRS` (colon-separated), or the repeatable
+  `--write-dir` / `--attach-dir` flags, confine writes or attachments to the
+  listed folders; the denylist still applies inside them.
+- All checks live in one shared module (`apple_mail_mcp/paths.py`) instead of
+  three copies, resolve `..` and symlinks before checking, and compare
+  case-insensitively to match APFS (`~/.ZSHRC` is `~/.zshrc`).
+
+### Fixed
+- `list_inbox_emails` in text output and `get_mailbox_unread_counts(summary_only=True)`
+  ignored `account` and returned every account; they now filter by it
+  (#135 by @proscar87).
+- `search_emails` on a mailbox over the whose-clause limit now stops its
+  bounded index scan at the first message outside a `date_from` window
+  (newest-first) or `date_to` window (oldest-first), instead of reading the
+  full 4000-message cap. A one-week search of a 6,000-message mailbox no
+  longer holds the automation lock for minutes (#133 by
+  @joel-alturaeducation, related to #87 and #132).
+- The Claude Code plugin manifests (`plugin/.claude-plugin/plugin.json`,
+  `.claude-plugin/marketplace.json`) were stuck at 3.1.2, so `claude plugin
+  update` reported installs as current. They are now at 3.2.1 and
+  `scripts/check_versions.py` and `RELEASING.md` cover them (#127 by
+  @proscar87).
+- `move_email` no longer treats a negative `older_than_days` as a filter (it
+  added no date condition, so the call moved everything), and `manage_trash`
+  rejects an unrecognised `action` instead of falling through to
+  `move_to_trash` (#124 by @proscar87).
+- `reply_to_email` now restores the user's clipboard. The restore step sat
+  after the script's `return`, so it never ran and every reply (send, draft
+  or open) left the reply body on the clipboard. The error path now restores
+  it too, as does `forward_email`'s error path when a `message` was pasted
+  (#106).
+
+## [3.2.1] - 2026-10-15
+
+### Fixed
+- The server failed to start on any fresh install since the `mcp` SDK 2.0
+  release (`ModuleNotFoundError: No module named 'mcp.server.fastmcp'`, #97).
+  `server.py` imported `FastMCP` from the SDK's bundled v1 module instead of
+  from the declared `fastmcp` dependency, so once `fastmcp` 4.x pulled in
+  `mcp` 2.x the import path vanished. Now imports `from fastmcp import
+  FastMCP`. `--read-only` also called `FastMCP.remove_tool()`, which is
+  deprecated in fastmcp 3.x and removed in 4.x; it now goes through
+  `local_provider.remove_tool()`, which both support.
+- `search_emails` no longer hangs Mail or returns nothing on very large
+  mailboxes such as a Gmail INBOX (#41, #87). Above 5,000 messages the full
+  `whose` scan is skipped in favour of a bounded index scan (newest first for
+  `date_desc`), capped at 4,000 messages per call; when the cap is reached
+  the response says so (`scan_limited` in JSON, a NOTE line in text) instead
+  of silently returning less. Body-text search on large mailboxes is bounded
+  too.
+- Reply and forward drafts render in the intended sans-serif font instead of
+  Mail's small serif default (#100, #101). The reply/forward HTML now carries
+  an explicit font style rather than `font: inherit`.
 - Removed the redundant `plugin/commands/email-management.md` slash command.
   It shadowed `plugin/skills/email-management/` under the same
   `apple-mail:email-management` listing key, so every session showed two

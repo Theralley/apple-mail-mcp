@@ -48,11 +48,12 @@ of messages a call touches:
    missing the Automation permission for Mail. The user grants it under
    System Settings > Privacy & Security > Automation. Saving attachments
    needs file access to the target folder.
-5. **Startup.** `uvx --from mcp-apple-mail --with 'mcp<2' mcp-apple-mail`
-   takes about 1 s warm and about 15 s on a cold uv cache. The `mcp<2` pin is
-   required, because the server imports `mcp.server.fastmcp`.
+5. **Startup.** `uvx --from mcp-apple-mail mcp-apple-mail` takes about 1 s
+   warm and about 15 s on a cold uv cache. Since 3.2.1 the server imports
+   `FastMCP` from `fastmcp`, so no `mcp<2` pin is needed (an older install
+   that fails with `No module named 'mcp.server.fastmcp'` needs an update).
 6. **Measure.** From a checkout of this repository:
-   `python3 scripts/mcp_stdio_client.py --call list_accounts '{}' -- uvx --from mcp-apple-mail --with 'mcp<2' mcp-apple-mail --read-only`
+   `python3 scripts/mcp_stdio_client.py --call list_accounts '{}' -- uvx --from mcp-apple-mail mcp-apple-mail --read-only`
    prints the startup time, `tools/list` time and per-call time without
    printing mail content.
 
