@@ -19,6 +19,48 @@ from apple_mail_mcp.core import (
     build_filter_condition,
 )
 
+# Names Mail gives an account's trash: IMAP and iCloud, Exchange, some IMAP
+# servers, and Gmail in British English.
+TRASH_MAILBOX_NAMES = ("Trash", "Deleted Items", "Deleted Messages", "Bin")
+
+# Mail's AppleScript interface has no command that erases a message. `delete`
+# means "move to the trash": on a message that is already there it does
+# nothing, and on an Exchange account (macOS 27, 2026-11-14) a batch of such
+# deletes made Mail abort in EmailDaemon (deleteMessages -> transferMessages).
+# So no tool here sends `delete` or `move` to a message that is already in the
+# trash; the trash actions report what is there and say how to erase it.
+TRASH_ERASE_REFUSAL = (
+    "Nothing was deleted. Mail's AppleScript interface cannot erase messages "
+    "that are already in the trash: `delete` only moves a message to the trash, "
+    "does nothing to one that is already there, and a batch of such deletes has "
+    "crashed Mail on an Exchange account. Erase them in Mail itself (Mailbox > "
+    "Erase Deleted Items for the whole trash, or select the messages in the "
+    "trash and delete them there), or leave them for the server's retention "
+    "policy."
+)
+
+
+def _normalize_mailbox_name(name: Optional[str]) -> str:
+    return (name or "").strip().strip("/").casefold()
+
+
+def _is_trash_name(name: Optional[str]) -> bool:
+    return _normalize_mailbox_name(name) in {n.casefold() for n in TRASH_MAILBOX_NAMES}
+
+
+def _trash_lookup_script(var_name: str = "trashMailbox") -> str:
+    """AppleScript that sets ``var_name`` to targetAccount's trash mailbox."""
+    names = ", ".join(f'"{n}"' for n in TRASH_MAILBOX_NAMES)
+    tried = ", ".join(TRASH_MAILBOX_NAMES)
+    return f'''set {var_name} to missing value
+                    repeat with trashName in {{{names}}}
+                        try
+                            set {var_name} to mailbox (trashName as text) of targetAccount
+                            exit repeat
+                        end try
+                    end repeat
+                    if {var_name} is missing value then error "no trash mailbox in this account (tried {tried})"'''
+
 
 @mcp.tool()
 @inject_preferences
@@ -63,6 +105,12 @@ def move_email(
     blocked = server.read_only_block("move_email")
     if blocked:
         return blocked
+
+    if _normalize_mailbox_name(from_mailbox) == _normalize_mailbox_name(to_mailbox):
+        return (
+            f"Error: from_mailbox and to_mailbox are the same mailbox ('{to_mailbox}'). "
+            "Nothing was moved: the messages are already there."
+        )
 
     safe_account = escape_applescript(account)
     safe_from = escape_applescript(from_mailbox)
@@ -733,21 +781,22 @@ def manage_trash(
     would be deleted without acting. Set dry_run=False to actually move to trash.
 
     Mail's AppleScript interface has no command that erases a message: `delete`
-    means "move to Trash", and on a message that already sits in Trash it does
-    nothing. "delete_permanent" and "empty_trash" therefore usually remove
-    nothing at all. Both report the real before/after mailbox count instead of
-    the number of delete calls, and say so when nothing was removed; emptying
-    the trash for good has to happen in Mail itself.
+    means "move to the trash", it does nothing to a message that is already
+    there, and a batch of such deletes has crashed Mail on an Exchange account.
+    "delete_permanent" and "empty_trash" therefore never delete anything: they
+    report what is in the account's trash (Trash, Deleted Items, Deleted
+    Messages or Bin) and say how to erase it in Mail. "move_to_trash" refuses a
+    source mailbox that is itself the trash.
 
     Args:
         account: Account name (e.g., "Gmail", "Work")
-        action: Action to perform: "move_to_trash", "delete_permanent", "empty_trash"
+        action: Action to perform: "move_to_trash", "delete_permanent" (lists the matching trash messages), "empty_trash" (counts the trash)
         subject_keyword: Optional keyword to filter emails (not used for empty_trash)
         subject_keywords: Optional list of subject keywords; matches any keyword
         sender: Optional sender to filter emails (not used for empty_trash)
         mailbox: Source mailbox (default: "INBOX", not used for empty_trash or delete_permanent)
-        max_deletes: Maximum number of emails to delete (safety limit, default: 5)
-        confirm_empty: Must be True to execute "empty_trash" action (safety confirmation)
+        max_deletes: Maximum number of emails to move, or to list for delete_permanent (default: 5)
+        confirm_empty: Ignored; empty_trash no longer deletes anything
         apply_to_all: Must be True to allow operations without subject_keyword or sender filter
         older_than_days: Optional age filter - only affect emails older than N days
         dry_run: If True (default), preview what would be affected without acting
@@ -772,55 +821,28 @@ def manage_trash(
     subject_terms = normalize_search_terms(subject_keyword, subject_keywords)
 
     if action == "empty_trash":
-        if not confirm_empty:
-            return (
-                "Error: empty_trash attempts to delete ALL messages in the trash. "
-                "Set confirm_empty=True to proceed."
-            )
+        # Read only: count the trash, never send it `delete` (see TRASH_ERASE_REFUSAL).
         script = f'''
         tell application "Mail"
-            set outputText to "EMPTYING TRASH" & return & return
-
             try
                 set targetAccount to account "{safe_account}"
-                set trashMailbox to mailbox "Trash" of targetAccount
-                set trashMessages to every message of trashMailbox
-                set messageCount to count of trashMessages
-                set deleteCount to 0
-
-                -- Delete messages in trash, respecting max_deletes.
-                -- trashMessages is a list captured up front, so deleting does
-                -- not shift its indices; a forward loop takes the first N.
-                repeat with msgIndex from 1 to messageCount
-                    if deleteCount >= {max_deletes} then exit repeat
-                    delete (item msgIndex of trashMessages)
-                    set deleteCount to deleteCount + 1
-                end repeat
-
-                -- Report what actually left the mailbox, not how often the
-                -- delete command was issued. Mail's AppleScript `delete` means
-                -- "move to Trash"; on a message that already sits in Trash it
-                -- is a no-op, and the old count reported those no-ops as
-                -- successful deletions.
-                set remainingCount to count of messages of trashMailbox
-                set removedCount to messageCount - remainingCount
-
-                set outputText to outputText & "Account: {safe_account}" & return
-                set outputText to outputText & "   Trash before: " & messageCount & ", after: " & remainingCount & return
-                set outputText to outputText & "   Actually removed: " & removedCount & " message(s)" & return
-                if removedCount is 0 then
-                    set outputText to outputText & "⚠ Nothing was removed. Mail's AppleScript interface has no command that erases messages from the trash; `delete` only moves a message to Trash. Empty the trash in Mail itself." & return
-                else if deleteCount < messageCount then
-                    set outputText to outputText & "   (limited by max_deletes=" & {max_deletes} & ")" & return
-                end if
-
+                {_trash_lookup_script()}
+                return "TRASH" & tab & (name of trashMailbox) & tab & ((count of messages of trashMailbox) as string)
             on error errMsg
                 return "Error: " & errMsg
             end try
-
-            return outputText
         end tell
         '''
+        raw = (run_applescript(script) or "").strip()
+        parts = raw.split("\t")
+        if len(parts) != 3 or parts[0] != "TRASH":
+            return raw or "Error: could not read the trash mailbox"
+        return (
+            "EMPTY TRASH: not done\n\n"
+            f"Account: {account}\n"
+            f"Trash mailbox: {parts[1]}, {parts[2]} message(s)\n\n"
+            f"⚠ {TRASH_ERASE_REFUSAL}"
+        )
     elif action == "delete_permanent":
         # Safety check: require at least one filter or explicit apply_to_all
         if not subject_terms and not sender and not apply_to_all:
@@ -843,67 +865,57 @@ def manage_trash(
                 "set matchingMessages to every message of trashMailbox"
             )
 
+        # Read only: list the matches, never send them `delete`
+        # (see TRASH_ERASE_REFUSAL).
         script = f'''
         tell application "Mail"
             with timeout of 300 seconds
-                set outputText to "PERMANENTLY DELETING EMAILS" & return & return
-                set deleteCount to 0
-
                 try
                     set targetAccount to account "{safe_account}"
-                    set trashMailbox to mailbox "Trash" of targetAccount
+                    {_trash_lookup_script()}
                     {matching_messages_script}
-                    set matchingCount to count of matchingMessages
-
-                    if matchingCount is 0 then
-                        set targetMessages to {{}}
-                    else if matchingCount > {max_deletes} then
-                        set targetMessages to items 1 thru {max_deletes} of matchingMessages
-                    else
-                        set targetMessages to matchingMessages
-                    end if
-
-                    set trashBefore to count of messages of trashMailbox
-
-                    -- Walk the captured list (deleting does not shift its
-                    -- indices) and only name a message once its delete call
-                    -- returned without error.
-                    repeat with msgIndex from (count of targetMessages) to 1 by -1
+                    set outputText to "TRASH" & tab & (name of trashMailbox) & tab & ((count of matchingMessages) as string) & linefeed
+                    set shownCount to 0
+                    repeat with aMessage in matchingMessages
+                        if shownCount >= {max_deletes} then exit repeat
                         try
-                            set aMessage to item msgIndex of targetMessages
-                            set messageSubject to subject of aMessage
-                            set messageSender to sender of aMessage
-
-                            delete aMessage
-                            set deleteCount to deleteCount + 1
-
-                            set outputText to outputText & "Targeted: " & messageSubject & return
-                            set outputText to outputText & "   From: " & messageSender & return & return
+                            set outputText to outputText & ((id of aMessage) as string) & tab & (subject of aMessage) & tab & (sender of aMessage) & linefeed
+                            set shownCount to shownCount + 1
                         end try
                     end repeat
-
-                    -- The truth is the mailbox count, not the number of delete
-                    -- calls: Mail's `delete` means "move to Trash" and does
-                    -- nothing to a message that is already there.
-                    set trashAfter to count of messages of trashMailbox
-                    set removedCount to trashBefore - trashAfter
-
-                    set outputText to outputText & "========================================" & return
-                    set outputText to outputText & "TARGETED: " & deleteCount & ", ACTUALLY REMOVED: " & removedCount & return
-                    if removedCount is 0 and deleteCount > 0 then
-                        set outputText to outputText & "⚠ Nothing was erased. Mail's AppleScript interface cannot permanently delete a message that already sits in Trash. Erase it in Mail itself." & return
-                    end if
-                    set outputText to outputText & "========================================" & return
-
+                    return outputText
                 on error errMsg
                     return "Error: " & errMsg
                 end try
-
-                return outputText
             end timeout
         end tell
         '''
+        raw = (run_applescript(script, timeout=300) or "").strip()
+        lines = raw.splitlines()
+        head = lines[0].split("\t") if lines else []
+        if len(head) != 3 or head[0] != "TRASH":
+            return raw or "Error: could not read the trash mailbox"
+        rows = []
+        for line in lines[1:]:
+            parts = line.split("\t", 2)
+            if len(parts) == 3 and parts[0].strip().isdigit():
+                rows.append(f"  ID {parts[0].strip()}: {parts[1]} (from {parts[2]})")
+        listing = "\n".join(rows) if rows else "  (none)"
+        more = ""
+        if head[2].strip().isdigit() and int(head[2]) > len(rows):
+            more = f"\n  ... {int(head[2]) - len(rows)} more (max_deletes={max_deletes})"
+        return (
+            "DELETE PERMANENTLY: not done\n\n"
+            f"Account: {account}\n"
+            f"{head[2]} matching message(s) in {head[1]}:\n{listing}{more}\n\n"
+            f"⚠ {TRASH_ERASE_REFUSAL}"
+        )
     else:  # move_to_trash
+        if _is_trash_name(mailbox):
+            return (
+                f"Error: '{mailbox}' is the trash. Nothing was moved: the messages "
+                f"are already in the trash. {TRASH_ERASE_REFUSAL}"
+            )
         # Safety check: require at least one filter or explicit apply_to_all
         has_filter = bool(subject_terms) or bool(sender) or (
             older_than_days is not None and older_than_days > 0
@@ -946,8 +958,7 @@ def manage_trash(
             move_script = "move aMessage to trashMailbox"
             result_verb = "Moved to trash"
 
-        trash_setup = "" if dry_run else """
-                    set trashMailbox to mailbox "Trash" of targetAccount"""
+        trash_setup = "" if dry_run else _trash_lookup_script()
 
         script = f'''
         tell application "Mail"

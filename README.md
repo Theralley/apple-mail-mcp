@@ -136,7 +136,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `move_email` | Move/archive emails with filters (subject, sender, date, read status, dry-run) |
 | `update_email_status` | Mark read/unread, flag/unflag (optional flag color) — by filters or message IDs |
 | `set_email_read_status` | Mark given message IDs read or unread, confirmed in Mail's database (allowed under `--read-only`) |
-| `manage_trash` | Soft delete, permanent delete, empty trash (with dry-run) |
+| `manage_trash` | Move mail to the trash (with dry run); count the trash or list matches in it. Mail's AppleScript cannot erase mail, so nothing is deleted from the trash |
 
 ### Composition
 | Tool | Description |

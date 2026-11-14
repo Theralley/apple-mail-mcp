@@ -151,6 +151,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `list`. The README lists the exact set.
 
 ### Fixed
+- **Deleting from the trash could crash Mail; the trash actions no longer
+  delete.** Mail's AppleScript `delete` only moves a message to the trash and
+  does nothing to one that is already there. On an Exchange account (macOS
+  27) a batch of 23 such deletes made Mail abort in EmailDaemon
+  (`deleteMessages` -> `transferMessages`). `manage_trash` `empty_trash` now
+  counts the trash and `delete_permanent` lists the matching messages; both
+  send no `delete` and say how to erase in Mail. `confirm_empty` is ignored.
+  `move_to_trash` refuses a source mailbox that is the trash, and
+  `move_email` refuses a move into the mailbox the messages are already in.
+  The trash is found by name (Trash, Deleted Items, Deleted Messages, Bin)
+  instead of assuming "Trash", which does not exist on Exchange accounts.
 - **Drafts were sent as a quote ("> " on every line).** On macOS 27 Mail
   stores any body a script puts into an outgoing message (`content:`, even
   empty, `set content`, `make new paragraph`, scripted attachments) as

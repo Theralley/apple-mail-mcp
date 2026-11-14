@@ -1,68 +1,127 @@
-"""Tests for manage_trash: report what Mail actually removed."""
+"""Tests for manage_trash: never send `delete` or `move` to the trash itself.
 
+Mail's AppleScript `delete` does nothing to a message that is already in the
+trash, and on an Exchange account a batch of such deletes made Mail abort.
+The trash actions therefore only report, and move_to_trash and move_email
+refuse a move into the mailbox the messages are already in.
+"""
+
+import re
 import unittest
 from unittest.mock import patch
 
 from apple_mail_mcp.tools import manage as manage_tools
 
+# A line of AppleScript that starts with a delete or move command.
+_MUTATING_COMMAND = re.compile(r"^\s*(delete|move)\b", re.MULTILINE)
 
-def _script_for(**kwargs):
+
+def _run(return_value="", **kwargs):
     with patch(
-        "apple_mail_mcp.tools.manage.run_applescript", return_value=""
+        "apple_mail_mcp.tools.manage.run_applescript", return_value=return_value
     ) as mock_run:
-        manage_tools.manage_trash(account="Work", **kwargs)
-    mock_run.assert_called_once()
-    return mock_run.call_args[0][0]
+        result = manage_tools.manage_trash(account="Work", **kwargs)
+    return result, mock_run
+
+
+class TrashLookupTests(unittest.TestCase):
+    def test_finds_the_exchange_trash_too(self):
+        script = manage_tools._trash_lookup_script()
+        for name in ("Trash", "Deleted Items", "Deleted Messages", "Bin"):
+            self.assertIn(f'"{name}"', script)
+        self.assertIn('error "no trash mailbox', script)
+
+    def test_trash_names_are_recognised_case_insensitively(self):
+        self.assertTrue(manage_tools._is_trash_name("deleted items"))
+        self.assertTrue(manage_tools._is_trash_name(" Trash/"))
+        self.assertFalse(manage_tools._is_trash_name("INBOX"))
+        self.assertFalse(manage_tools._is_trash_name(None))
 
 
 class EmptyTrashTests(unittest.TestCase):
-    def setUp(self):
-        self.script = _script_for(action="empty_trash", confirm_empty=True)
+    def test_sends_no_delete_and_needs_no_confirmation(self):
+        result, mock_run = _run(
+            return_value="TRASH\tDeleted Items\t76", action="empty_trash"
+        )
+        mock_run.assert_called_once()
+        script = mock_run.call_args[0][0]
+        self.assertIsNone(_MUTATING_COMMAND.search(script))
+        self.assertIn("count of messages of trashMailbox", script)
+        self.assertIn("EMPTY TRASH: not done", result)
+        self.assertIn("Deleted Items, 76 message(s)", result)
+        self.assertIn("Nothing was deleted", result)
+        self.assertIn("Erase Deleted Items", result)
 
-    def test_iterates_forward_over_the_captured_list(self):
-        # trashMessages is captured up front, so a forward index loop is safe
-        # and max_deletes takes the first N messages, not the last N.
-        self.assertIn("repeat with msgIndex from 1 to messageCount", self.script)
-        self.assertNotIn("repeat with aMessage in trashMessages", self.script)
-
-    def test_confirmation_error_does_not_promise_permanent_deletion(self):
-        result = manage_tools.manage_trash(account="Work", action="empty_trash")
-        self.assertIn("attempts to delete", result)
-        self.assertNotIn("permanently deletes", result)
-
-    def test_reports_the_measured_mailbox_count(self):
-        self.assertIn("set remainingCount to count of messages of trashMailbox", self.script)
-        self.assertIn("Actually removed: ", self.script)
-        self.assertNotIn("Emptied trash for account", self.script)
-
-    def test_warns_when_nothing_was_removed(self):
-        self.assertIn("if removedCount is 0 then", self.script)
+    def test_a_script_error_is_passed_through(self):
+        result, _ = _run(return_value="Error: no trash mailbox", action="empty_trash")
+        self.assertEqual(result, "Error: no trash mailbox")
 
 
 class DeletePermanentTests(unittest.TestCase):
-    def setUp(self):
-        self.script = _script_for(
-            action="delete_permanent", subject_keyword="x", dry_run=False
+    def test_lists_matches_without_deleting(self):
+        reply = (
+            "TRASH\tDeleted Items\t3\n"
+            "101\t[probe] one\tme@example.invalid\n"
+            "102\t[probe] two\tme@example.invalid\n"
         )
-
-    def test_reports_the_measured_mailbox_count(self):
-        # Mail's `delete` is a no-op on a message already in Trash, so counting
-        # delete calls reported deletions that never happened.
-        self.assertIn("set trashBefore to count of messages of trashMailbox", self.script)
-        self.assertIn("set trashAfter to count of messages of trashMailbox", self.script)
-        self.assertIn("ACTUALLY REMOVED", self.script)
-        self.assertNotIn("TOTAL DELETED", self.script)
-        self.assertNotIn("Permanently deleted: ", self.script)
-
-    def test_iterates_over_the_captured_list(self):
-        self.assertIn(
-            "repeat with msgIndex from (count of targetMessages) to 1 by -1",
-            self.script,
+        result, mock_run = _run(
+            return_value=reply,
+            action="delete_permanent",
+            subject_keyword="[probe]",
+            max_deletes=2,
+            dry_run=False,
         )
+        script = mock_run.call_args[0][0]
+        self.assertIsNone(_MUTATING_COMMAND.search(script))
+        self.assertIn("if shownCount >= 2 then exit repeat", script)
+        self.assertIn("DELETE PERMANENTLY: not done", result)
+        self.assertIn("3 matching message(s) in Deleted Items", result)
+        self.assertIn("ID 101: [probe] one", result)
+        self.assertIn("ID 102: [probe] two", result)
+        self.assertIn("1 more (max_deletes=2)", result)
+        self.assertIn("Nothing was deleted", result)
+
+    def test_still_requires_a_filter(self):
+        result, mock_run = _run(action="delete_permanent", dry_run=False)
+        mock_run.assert_not_called()
+        self.assertTrue(result.startswith("Error: No filter provided"))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class MoveToTrashTests(unittest.TestCase):
+    def test_refuses_a_source_that_is_the_trash(self):
+        for name in ("Deleted Items", "Trash", "bin"):
+            result, mock_run = _run(
+                action="move_to_trash",
+                mailbox=name,
+                subject_keyword="[probe]",
+                dry_run=False,
+            )
+            mock_run.assert_not_called()
+            self.assertIn("is the trash. Nothing was moved", result)
+
+    def test_moves_into_the_looked_up_trash(self):
+        _, mock_run = _run(
+            action="move_to_trash", subject_keyword="Invoice", dry_run=False
+        )
+        script = mock_run.call_args[0][0]
+        self.assertIn('repeat with trashName in {"Trash", "Deleted Items"', script)
+        self.assertIn("move aMessage to trashMailbox", script)
+        self.assertNotIn('mailbox "Trash" of targetAccount', script)
+
+
+class MoveEmailSameMailboxTests(unittest.TestCase):
+    def test_a_move_into_the_source_mailbox_is_refused(self):
+        with patch("apple_mail_mcp.tools.manage.run_applescript") as mock_run:
+            for src, dst in (("INBOX", "Inbox"), ("Deleted Items", "deleted items/")):
+                result = manage_tools.move_email(
+                    account="Work",
+                    to_mailbox=dst,
+                    from_mailbox=src,
+                    message_ids=[1],
+                    dry_run=False,
+                )
+                self.assertIn("are the same mailbox", result)
+        mock_run.assert_not_called()
 
 
 class InvalidActionTests(unittest.TestCase):
@@ -78,3 +137,7 @@ class InvalidActionTests(unittest.TestCase):
             )
         mock_run.assert_not_called()
         self.assertTrue(result.startswith("Error: Invalid action 'list'"))
+
+
+if __name__ == "__main__":
+    unittest.main()

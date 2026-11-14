@@ -66,14 +66,16 @@ With `--read-only` the server registers only an allowlist:
   views, statistics, follow-ups and the dashboard;
 - `save_email_attachment` and `export_emails`, which write local files only;
 - `synchronize_account`, which fetches new mail;
-- `create_rich_email_draft`, and `manage_drafts` with `action` `create` or
-  `list`.
+- `index_mail`, which builds the local search index;
+- `create_rich_email_draft`, and `manage_drafts` with `action` `create`,
+  `list` or `delete`;
+- `set_email_read_status`, which changes only the read flag, by message ID.
 
 Everything else is not registered, and it is refused at call time with
 "... is blocked by --read-only". That covers sending, replying, forwarding,
-moving, flagging, marking, trash, creating mailboxes, and sending, opening or
-deleting drafts. It is intended behaviour. The user does those in Mail, or
-runs a server without `--read-only`.
+moving, flagging, filter-based marking, trash, creating mailboxes, and
+sending or opening drafts. It is intended behaviour. The user does those in
+Mail, or runs a server without `--read-only`.
 
 ## Known fixed causes (this fork)
 
@@ -90,3 +92,29 @@ while an account syncs (including right after `synchronize_account`), calls
 on that account can be 10 to 100 times slower. Retry after the sync, or work
 on another account in the meantime. The `apple-mail-inbox-triage`
 skill shows the fast calls to use.
+
+## Deleting from the trash, and scripted selections
+
+- **Nothing can erase mail by script.** Mail's AppleScript `delete` means
+  "move to the trash". On a message that is already in the trash (Trash,
+  Deleted Items, Deleted Messages, Bin) it returns without an error and
+  does nothing. On an Exchange account a batch of 23 such deletes made Mail
+  abort (SIGABRT in EmailDaemon `deleteMessages` -> `transferMessages`;
+  macOS 27, 2026-11-14). No data changed, but Mail had to relaunch.
+  `manage_trash` therefore never sends `delete` to the trash:
+  `empty_trash` counts it, `delete_permanent` lists the matches, and both
+  say how to erase them in Mail (Mailbox > Erase Deleted Items, or select
+  the messages in the trash and delete them there). `move_to_trash` refuses
+  a source that is the trash, and `move_email` refuses a move into the
+  mailbox the messages are already in. Do not work around this with
+  hand-written AppleScript.
+- **A deleted draft lands in the trash.** `manage_drafts(action="delete")`
+  moves the draft to the account's trash, where it stays until the user
+  erases it or the server's retention policy removes it. Test and probe
+  drafts accumulate there the same way; list them for the user instead of
+  trying to erase them.
+- **Never act on a scripted selection without checking it.** `set selected
+  messages of message viewer 1 to {...}` in a threaded viewer selected one
+  unrelated, real message and missed one of 23 targets. Before any menu or
+  key action on a selection, read `selected messages` back and compare
+  every ID and subject with the intended set. Stop when they differ.

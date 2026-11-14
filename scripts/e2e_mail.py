@@ -15,7 +15,9 @@ Safety rules the script enforces:
     that same draft again. Mail keeps the invisible outgoing message that
     manage_drafts(action="create") opens until Mail quits (AppleScript cannot
     close it), so the draft can be re-saved later; delete any leftover
-    "[mcp-e2e]" draft by hand;
+    "[mcp-e2e]" draft by hand. The deleted draft itself lands in the
+    account's trash, and no script can erase it from there (scripted deletes
+    in the trash do nothing and have crashed Mail): erase it in Mail;
   * create_mailbox is skipped, because no tool can remove the folder again.
 
 Account names come from the command line, never from this file:
