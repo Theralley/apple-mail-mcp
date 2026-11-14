@@ -879,6 +879,10 @@ def _split_thread_by_linkage(records: List[Dict[str, Any]]):
     through Message-ID references belongs to it. A message without any
     Message-ID at all stays in the thread, since dropping it would hide mail
     that the old subject-only grouping did show. (From upstream 695486a.)
+
+    ``references`` is None when a message's headers could not be read (its
+    file is not on disk). Such a message is never called unlinked; if it is
+    the seed, nothing can be linked reliably and every candidate is kept.
     """
     if not records:
         return [], []
@@ -886,6 +890,11 @@ def _split_thread_by_linkage(records: List[Dict[str, Any]]):
     # The seed must be the newest message, or the thread grows from the wrong end.
     records = sorted(records, key=lambda record: record["age_seconds"])
     seed = records[-1]
+    if seed["references"] is None:
+        return records, []
+    unknown = [record for record in records if record["references"] is None]
+    for record in unknown:
+        record["references"] = set()
     thread_ids = set()
     if seed["message_id"]:
         thread_ids.add(seed["message_id"])
@@ -909,7 +918,7 @@ def _split_thread_by_linkage(records: List[Dict[str, Any]]):
                 changed = True
 
     for record in list(remaining):
-        if not record["message_id"] and not record["references"]:
+        if (not record["message_id"] and not record["references"]) or any(record is u for u in unknown):
             linked.append(record)
             remaining.remove(record)
 
@@ -1225,15 +1234,16 @@ def _search_records_from_index(
     return _parse_search_records(clean_script_output(RECORD_SEP.join(lines))), incomplete, body_texts
 
 
-def _thread_references(message_id: int) -> set:
-    """Message-IDs in the In-Reply-To / References headers of a message on disk."""
+def _thread_references(message_id: int) -> Optional[set]:
+    """Message-IDs in the In-Reply-To / References headers of a message on
+    disk, or None when its file cannot be read (unknown, not "no links")."""
     path = find_message_file(message_id)
     if path is None:
-        return set()
+        return None
     try:
         msg = parse_emlx(path.read_bytes())
     except (OSError, ValueError):
-        return set()
+        return None
     text = "".join(f"{name}: {value}\n" for name in ("In-Reply-To", "References") for value in msg.get_all(name, []))
     return _referenced_ids(text)
 

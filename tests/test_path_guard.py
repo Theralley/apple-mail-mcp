@@ -354,6 +354,21 @@ class ToolWiringTests(_FakeHomeTestCase):
         self.assertEqual(paths_out, [])
         self.assertTrue(error.startswith("Error:"), error)
 
+    def test_compose_attachment_rejects_credentials_under_config(self):
+        # Upstream's read guard allows ~/.config except a few named folders;
+        # this fork keeps the whole folder off-limits (tokens live there, e.g.
+        # rclone.conf), as manage_drafts does.
+        self._touch(".config", "rclone", "rclone.conf")
+        paths_out, error = compose_tools._validate_attachment_paths("~/.CONFIG/rclone/rclone.conf")
+        self.assertEqual(paths_out, [])
+        self.assertIn("protected folder", error)
+
+    def test_compose_attachment_allows_documents(self):
+        doc = self._touch("Documents", "offer.pdf")
+        paths_out, error = compose_tools._validate_attachment_paths("~/Documents/offer.pdf")
+        self.assertIsNone(error)
+        self.assertEqual(paths_out, [doc])
+
     def test_rich_draft_output_path_rejects_zshrc(self):
         with (
             patch("apple_mail_mcp.tools.compose.run_applescript", return_value=""),

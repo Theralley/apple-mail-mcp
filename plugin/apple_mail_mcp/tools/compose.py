@@ -612,9 +612,13 @@ return "{success_text}"
 def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[str]]:
     """Validate and resolve attachment file paths.
 
-    Splits comma-separated paths, expands tildes, resolves symlinks,
-    and enforces the shared read guard from ``apple_mail_mcp.paths``
-    (no secrets such as ~/.ssh, keychains or browser profiles; file must exist).
+    Splits comma-separated paths, expands tildes, resolves symlinks, and
+    enforces both guards: this fork's draft rule (home or temp folders only,
+    no protected folders such as ~/.ssh or ~/.config, no key-like file
+    names; draft_mime.checked_local_path) and the shared read guard from
+    ``apple_mail_mcp.paths`` (secrets denylist, --attach-dir). The file must
+    exist. Upstream 3.3.0 dropped the first rule, which made credential files
+    under ~/.config attachable again; it is kept here on purpose.
 
     Returns:
         A tuple of (resolved_paths, error_message).
@@ -627,6 +631,10 @@ def _validate_attachment_paths(attachments: str) -> Tuple[List[str], Optional[st
         if not raw_path:
             continue
 
+        try:
+            draft_mime.checked_local_path(raw_path)
+        except draft_mime.DraftError as exc:
+            return [], f"Error: {exc}"
         resolved, path_error = validate_read_path(raw_path)
         if path_error:
             return [], path_error

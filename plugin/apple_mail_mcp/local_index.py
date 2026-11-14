@@ -465,6 +465,20 @@ def _mail_max_rowid() -> int:
     return int(ei.get_index().query("SELECT coalesce(max(ROWID), 0) FROM messages")[0][0])
 
 
+def _compatible(old: Set[str], fresh: Set[str]) -> Set[str]:
+    """The memberships in *old* (outside this run's scope) that still fit *fresh*.
+
+    "other" means "in neither inbox nor sent", so it excludes both. When a
+    scoped run sees a message in the inbox, a stale "other" from an earlier
+    run (the message has since moved) must go, and the other way round.
+    """
+    if fresh & {"inbox", "sent"}:
+        old = old - {"other"}
+    if "other" in fresh:
+        old = old - {"inbox", "sent"}
+    return old
+
+
 def _update_locked(conn, chosen, folders, rebuild, max_seconds, started, full_scope=True) -> UpdateResult:
     result = UpdateResult()
     seen_rowid = _mail_max_rowid()  # before reading, so nothing slips between
@@ -494,8 +508,8 @@ def _update_locked(conn, chosen, folders, rebuild, max_seconds, started, full_sc
                 continue
             keep = doc_folders - scope
         else:
-            keep = (doc_folders - scope) | item.folders
-            if not (doc_folders - scope):  # this run sees all of it: take its mailbox
+            keep = _compatible(doc_folders - scope, item.folders) | item.folders
+            if keep <= item.folders:  # nothing left from outside this run: take its mailbox
                 box = item.mailbox
         reconciled[doc_id] = keep
         if not keep:
@@ -519,7 +533,10 @@ def _update_locked(conn, chosen, folders, rebuild, max_seconds, started, full_sc
     index = ei.get_index()
     done = 0
     for start in range(0, len(todo), BATCH):
-        if time.monotonic() - started > max_seconds:
+        # Always index one batch: on a large store finding what is new can
+        # take most of a short budget (about 4 s for 53k messages), and a run
+        # that then indexed nothing would repeat that work on every search.
+        if start and time.monotonic() - started > max_seconds:
             break
         batch = todo[start:start + BATCH]
         recipients = _recipients(index, batch)

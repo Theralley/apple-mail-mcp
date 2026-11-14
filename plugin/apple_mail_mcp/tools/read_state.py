@@ -156,20 +156,33 @@ def set_email_read_status(
             else:
                 groups[(account, box.path)].append(message_id)
 
+    # Messages Mail may or may not have changed (the script stopped or timed
+    # out part way); their real state is read back below like the rest.
+    unknown: Dict[int, str] = {}
     for (account, path), group in groups.items():
         try:
             output = run_applescript(mark_script(account, path, group, read), timeout=60)
         except Exception as exc:  # noqa: BLE001 - reported per message
             output = ""
-            failure = str(exc)
+            failure = str(exc) or type(exc).__name__
         else:
             failure = ""
         if output.startswith("MAILBOX" + FIELD_SEP):
-            failure = output.partition(FIELD_SEP)[2]
+            # The mailbox was not found, so no message of this group was touched.
+            reason = output.partition(FIELD_SEP)[2]
+            for message_id in group:
+                outcome[message_id] = f"✗ Mail refused: {reason[:200]}"
+            continue
         results = _parse(output)
         for message_id in group:
-            text = results.get(message_id) or failure or "Mail gave no answer"
-            outcome[message_id] = "pending" if text == "ok" else f"✗ Mail refused: {text[:200]}"
+            text = results.get(message_id)
+            if text == "ok":
+                outcome[message_id] = "pending"
+            elif text:
+                outcome[message_id] = f"✗ Mail refused: {text[:200]}"
+            else:
+                outcome[message_id] = "pending"
+                unknown[message_id] = failure or "Mail gave no answer"
 
     pending = [i for i, text in outcome.items() if text == "pending"]
     deadline = time.monotonic() + CONFIRM_WAIT_S
@@ -187,6 +200,11 @@ def set_email_read_status(
         if state.get(message_id) == read:
             outcome[message_id] = f"✓ now {word}"
             changed += 1
+        elif message_id in unknown:
+            outcome[message_id] = (
+                f"? not confirmed ({unknown[message_id][:160]}); Mail's database does not show it "
+                f"{word}, so it is probably unchanged. Check before retrying"
+            )
         else:
             outcome[message_id] = f"? Mail accepted it, but its database does not show {word} yet; check again shortly"
 

@@ -96,6 +96,29 @@ class ThreadLinkageTests(unittest.TestCase):
         linked, _ = search_tools._split_thread_by_linkage(records)
         self.assertEqual([r["age_seconds"] for r in linked], [-300, -100])
 
+    def test_unreadable_seed_keeps_every_candidate(self):
+        # The newest message's file is not on disk, so its parent is unknown:
+        # splitting would call real parents strangers. Keep them all.
+        newest = _record("newest@x", age=-100)
+        newest["references"] = None
+        records = [_record("root@x", age=-300), _record("other@y", age=-200), newest]
+        linked, unlinked = search_tools._split_thread_by_linkage(records)
+        self.assertEqual(len(linked), 3)
+        self.assertEqual(unlinked, [])
+
+    def test_unreadable_message_is_never_called_unlinked(self):
+        unread = _record("lost@x", age=-200)
+        unread["references"] = None
+        records = [
+            _record("root@x", age=-300),
+            unread,
+            _record("stranger@y", age=-250),
+            _record("reply@x", refs=["root@x"], age=-100),
+        ]
+        linked, unlinked = search_tools._split_thread_by_linkage(records)
+        self.assertEqual([r["message_id"] for r in linked], ["root@x", "lost@x", "reply@x"])
+        self.assertEqual([r["message_id"] for r in unlinked], ["stranger@y"])
+
 
 class GetEmailThreadTests(unittest.TestCase):
     def _run(self, applescript_output, **kwargs):

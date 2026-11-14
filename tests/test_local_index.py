@@ -246,7 +246,7 @@ def test_refresh_does_a_full_check_after_a_while(mail, tmp_path, monkeypatch):
 
 def test_time_budget_resumes_newest_first(mail, monkeypatch):
     monkeypatch.setattr(li, "BATCH", 2)
-    clock = iter([0.0] + [0.0, 0.0, 99.0] + [99.0] * 50)
+    clock = iter([0.0] + [0.0, 99.0] + [99.0] * 50)  # start, then before batches 2 and 3
     monkeypatch.setattr(li.time, "monotonic", lambda: next(clock))
     result = li.update(max_seconds=10)
     assert (result.added, result.remaining) == (4, 2)
@@ -254,6 +254,23 @@ def test_time_budget_resumes_newest_first(mail, monkeypatch):
     monkeypatch.setattr(li.time, "monotonic", lambda: 0.0)
     result = li.update()
     assert (result.added, result.remaining, result.total) == (2, 0, 6)
+
+
+def test_a_spent_budget_still_indexes_one_batch(mail, monkeypatch):
+    # Preparation alone can use up a short search-refresh budget on a big
+    # store; the run must still make progress instead of indexing nothing.
+    monkeypatch.setattr(li, "BATCH", 2)
+    now = [0.0]
+    monkeypatch.setattr(li.time, "monotonic", lambda: now[0])
+    real = li.wanted_messages
+
+    def slow_prepare(*args, **kwargs):
+        now[0] = 99.0  # the clock passes the budget while preparing
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(li, "wanted_messages", slow_prepare)
+    result = li.update(max_seconds=5)
+    assert (result.added, result.remaining) == (2, 4)
 
 
 def test_one_writer_at_a_time(mail):
@@ -338,7 +355,7 @@ def test_new_mail_goes_before_retries(mail, tmp_path, monkeypatch):
     _add_message(tmp_path, mail, 99, 1, [], "Older but new to the index", "2026-11-01")
     (mail / "105.emlx").write_bytes(_emlx("Not downloaded", "arrived"))
     monkeypatch.setattr(li, "BATCH", 1)
-    clock = iter([0.0, 0.0, 99.0] + [99.0] * 50)  # start, batch 1, batch 2 (over budget)
+    clock = iter([0.0, 99.0] + [99.0] * 50)  # start, then before batch 2 (over budget); batch 1 always runs
     monkeypatch.setattr(li.time, "monotonic", lambda: next(clock))
     result = li.update(max_seconds=10)
     assert (result.added, result.retried, result.remaining) == (1, 0, 1)
@@ -464,6 +481,27 @@ def test_mark_read_reports_what_mail_did_not_do(mail, tmp_path, monkeypatch):
     assert "✗ Mail refused: Can't get message id 102" in out and "0 of 1 changed" in out
 
 
+def test_mark_read_reconciles_a_batch_that_timed_out(mail, tmp_path, monkeypatch):
+    # Mail changed the first message, then the script timed out: the result
+    # must come from Mail's database, not "refused" for the whole batch.
+    from apple_mail_mcp.tools import read_state
+
+    _set_read(tmp_path, 0, 101, 102)
+
+    def run(script, timeout=60):
+        _set_read(tmp_path, 1, 101)
+        raise TimeoutError("AppleScript execution timed out after 60 s")
+
+    monkeypatch.setattr(read_state, "run_applescript", run)
+    monkeypatch.setattr(read_state, "POLL_S", 0)
+    monkeypatch.setattr(read_state, "CONFIRM_WAIT_S", 0)
+    out = read_state.set_email_read_status([101, 102])
+    assert out.startswith("MARK AS READ: 1 of 2 changed")
+    assert "✓ now read · ID 101" in out
+    assert "? not confirmed (AppleScript execution timed out after 60 s)" in out and "ID 102" in out
+    assert "refused" not in out
+
+
 def test_mark_read_input_limits(mail, tmp_path, monkeypatch):
     from apple_mail_mcp import server
 
@@ -508,6 +546,30 @@ def test_a_move_between_other_mailboxes_updates_the_mailbox(mail, tmp_path):
     _, _, hits = _search(folder="other")
     assert {h.id: h.mailbox for h in hits} == {102: "Archive", 104: "Archive", 203: "[Gmail]/All Mail"}
     assert 102 not in _search(folder="inbox")[1]
+
+
+def test_a_scoped_run_drops_memberships_the_move_contradicts(mail, tmp_path):
+    # "other" excludes inbox and sent, so a scoped run that sees the message in
+    # its new place must not keep the old, contradicting membership.
+    li.update(folders=li.FOLDERS)
+    db = sqlite3.connect(str(tmp_path / "Envelope Index"))
+    db.execute("INSERT INTO mailboxes VALUES (7, 'ews://U1/Archive', NULL)")
+    db.execute("UPDATE messages SET mailbox = 1 WHERE ROWID = 104")  # Inbox/Notes -> Inbox
+    db.execute("UPDATE messages SET mailbox = 7 WHERE ROWID = 102")  # Inbox -> Archive
+    db.commit()
+    db.close()
+    li.update(folders=("inbox",))
+    assert 104 not in _search(folder="other")[1]
+    assert {h.id: h.mailbox for h in _search(folder="inbox")[2]}[104] == "Inbox"
+    li.update(folders=("other",))
+    assert 102 not in _search(folder="inbox")[1]
+    assert {h.id: h.mailbox for h in _search(folder="other")[2]}[102] == "Archive"
+    conn = li.connect_reader()
+    try:
+        folders = dict(conn.execute("SELECT id, folders FROM docs WHERE id IN (102, 104)").fetchall())
+    finally:
+        conn.close()
+    assert folders == {102: "other", 104: "inbox"}
 
 
 def test_index_mail_all_scope(mail):
