@@ -171,7 +171,7 @@ SIGNATURE_FILE = (
     b"Content-Transfer-Encoding: quoted-printable\n"
     b"Content-Type: text/html;\n\tcharset=utf-8\n"
     b"Mime-Version: 1.0 (Mac OS X Mail)\n\n"
-    b"<body style=3D\"x\"><div>Ann Example</div><div>ANTech</div></body>"
+    b"<body style=3D\"x\"><div>Ann Example</div><div>Example AB</div></body>"
 )
 
 
@@ -188,7 +188,7 @@ def test_single_signature_is_used(tmp_path):
     folder = _signature_dir(tmp_path, {"ACC": ["S1"]})
     sig, note = draft_mime.resolve_signature("ACC", selected={}, directory=folder)
     assert sig is not None and sig.id == "S1"
-    assert sig.html == "<div>Ann Example</div><div>ANTech</div>"
+    assert sig.html == "<div>Ann Example</div><div>Example AB</div>"
     assert "added" in note
 
 
