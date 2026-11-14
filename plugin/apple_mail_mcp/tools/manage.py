@@ -1,12 +1,17 @@
 """Management tools: moving, status updates, trash, and attachments."""
 
 import os
+import re
 from typing import List, Optional, Union
 
 from apple_mail_mcp import server
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.paths import validate_write_path
 from apple_mail_mcp.core import (
+    AS_FIELD_SEP,
+    AS_RECORD_SEP,
+    FIELD_SEP,
+    RECORD_SEP,
     resolve_flag_color,
     contains_any_condition,
     equals_any_numeric_condition,
@@ -42,6 +47,11 @@ TRASH_ERASE_REFUSAL = (
 
 def _normalize_mailbox_name(name: Optional[str]) -> str:
     return (name or "").strip().strip("/").casefold()
+
+
+def _one_line(text: str) -> str:
+    """A header value on one line: tabs and line breaks become single spaces."""
+    return re.sub(r"[\t\r\n]+", " ", text).strip()
 
 
 def _is_trash_name(name: Optional[str]) -> bool:
@@ -827,14 +837,14 @@ def manage_trash(
             try
                 set targetAccount to account "{safe_account}"
                 {_trash_lookup_script()}
-                return "TRASH" & tab & (name of trashMailbox) & tab & ((count of messages of trashMailbox) as string)
+                return "TRASH" & {AS_FIELD_SEP} & (name of trashMailbox) & {AS_FIELD_SEP} & ((count of messages of trashMailbox) as string)
             on error errMsg
                 return "Error: " & errMsg
             end try
         end tell
         '''
-        raw = (run_applescript(script) or "").strip()
-        parts = raw.split("\t")
+        raw = run_applescript(script) or ""
+        parts = raw.split(FIELD_SEP)
         if len(parts) != 3 or parts[0] != "TRASH":
             return raw or "Error: could not read the trash mailbox"
         return (
@@ -874,12 +884,12 @@ def manage_trash(
                     set targetAccount to account "{safe_account}"
                     {_trash_lookup_script()}
                     {matching_messages_script}
-                    set outputText to "TRASH" & tab & (name of trashMailbox) & tab & ((count of matchingMessages) as string) & linefeed
+                    set outputText to "TRASH" & {AS_FIELD_SEP} & (name of trashMailbox) & {AS_FIELD_SEP} & ((count of matchingMessages) as string)
                     set shownCount to 0
                     repeat with aMessage in matchingMessages
                         if shownCount >= {max_deletes} then exit repeat
                         try
-                            set outputText to outputText & ((id of aMessage) as string) & tab & (subject of aMessage) & tab & (sender of aMessage) & linefeed
+                            set outputText to outputText & {AS_RECORD_SEP} & ((id of aMessage) as string) & {AS_FIELD_SEP} & (subject of aMessage) & {AS_FIELD_SEP} & (sender of aMessage)
                             set shownCount to shownCount + 1
                         end try
                     end repeat
@@ -890,16 +900,23 @@ def manage_trash(
             end timeout
         end tell
         '''
-        raw = (run_applescript(script, timeout=300) or "").strip()
-        lines = raw.splitlines()
-        head = lines[0].split("\t") if lines else []
+        # Subjects can hold tabs and line breaks, so records are framed with
+        # the ASCII separators, and run_applescript's own trim keeps an empty
+        # last field (a second .strip() here would eat it).
+        raw = run_applescript(script, timeout=300) or ""
+        records = raw.split(RECORD_SEP)
+        head = records[0].split(FIELD_SEP)
         if len(head) != 3 or head[0] != "TRASH":
             return raw or "Error: could not read the trash mailbox"
         rows = []
-        for line in lines[1:]:
-            parts = line.split("\t", 2)
+        for record in records[1:]:
+            parts = record.split(FIELD_SEP)
             if len(parts) == 3 and parts[0].strip().isdigit():
-                rows.append(f"  ID {parts[0].strip()}: {parts[1]} (from {parts[2]})")
+                from_text = _one_line(parts[2])
+                from_text = f" (from {from_text})" if from_text else ""
+                rows.append(
+                    f"  ID {parts[0].strip()}: {_one_line(parts[1])}{from_text}"
+                )
         listing = "\n".join(rows) if rows else "  (none)"
         more = ""
         if head[2].strip().isdigit() and int(head[2]) > len(rows):
@@ -1016,8 +1033,6 @@ def manage_trash(
     result = run_applescript(script, timeout=300)
     return result
 
-
-import re
 
 # Characters that could break AppleScript strings or mailbox names
 _INVALID_MAILBOX_CHARS = re.compile(r"[\\\"<>|?*:\x00-\x1f]")

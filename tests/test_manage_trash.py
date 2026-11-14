@@ -10,10 +10,18 @@ import re
 import unittest
 from unittest.mock import patch
 
+from apple_mail_mcp.core import FIELD_SEP as F
+from apple_mail_mcp.core import RECORD_SEP as R
+from apple_mail_mcp.core import clean_script_output
 from apple_mail_mcp.tools import manage as manage_tools
 
 # A line of AppleScript that starts with a delete or move command.
 _MUTATING_COMMAND = re.compile(r"^\s*(delete|move)\b", re.MULTILINE)
+
+
+def _reply(*records):
+    """Script output the way run_applescript hands it back."""
+    return clean_script_output(R.join(F.join(fields) for fields in records))
 
 
 def _run(return_value="", **kwargs):
@@ -41,12 +49,14 @@ class TrashLookupTests(unittest.TestCase):
 class EmptyTrashTests(unittest.TestCase):
     def test_sends_no_delete_and_needs_no_confirmation(self):
         result, mock_run = _run(
-            return_value="TRASH\tDeleted Items\t76", action="empty_trash"
+            return_value=_reply(("TRASH", "Deleted Items", "76")),
+            action="empty_trash",
         )
         mock_run.assert_called_once()
         script = mock_run.call_args[0][0]
         self.assertIsNone(_MUTATING_COMMAND.search(script))
         self.assertIn("count of messages of trashMailbox", script)
+        self.assertIn("(character id 31)", script)
         self.assertIn("EMPTY TRASH: not done", result)
         self.assertIn("Deleted Items, 76 message(s)", result)
         self.assertIn("Nothing was deleted", result)
@@ -59,10 +69,10 @@ class EmptyTrashTests(unittest.TestCase):
 
 class DeletePermanentTests(unittest.TestCase):
     def test_lists_matches_without_deleting(self):
-        reply = (
-            "TRASH\tDeleted Items\t3\n"
-            "101\t[probe] one\tme@example.invalid\n"
-            "102\t[probe] two\tme@example.invalid\n"
+        reply = _reply(
+            ("TRASH", "Deleted Items", "3"),
+            ("101", "[probe] one", "me@example.invalid"),
+            ("102", "[probe] two", "me@example.invalid"),
         )
         result, mock_run = _run(
             return_value=reply,
@@ -74,12 +84,44 @@ class DeletePermanentTests(unittest.TestCase):
         script = mock_run.call_args[0][0]
         self.assertIsNone(_MUTATING_COMMAND.search(script))
         self.assertIn("if shownCount >= 2 then exit repeat", script)
+        self.assertIn("(character id 30)", script)
         self.assertIn("DELETE PERMANENTLY: not done", result)
         self.assertIn("3 matching message(s) in Deleted Items", result)
         self.assertIn("ID 101: [probe] one", result)
         self.assertIn("ID 102: [probe] two", result)
         self.assertIn("1 more (max_deletes=2)", result)
         self.assertIn("Nothing was deleted", result)
+
+    def test_tabs_and_line_breaks_in_a_subject_do_not_split_the_record(self):
+        reply = _reply(
+            ("TRASH", "Deleted Items", "2"),
+            ("101", "Quarter\treport", "a@example.invalid"),
+            ("102", "Line one\nline two", "b@example.invalid"),
+        )
+        result, _ = _run(
+            return_value=reply,
+            action="delete_permanent",
+            subject_keyword="report",
+            max_deletes=5,
+        )
+        self.assertIn("ID 101: Quarter report (from a@example.invalid)", result)
+        self.assertIn("ID 102: Line one line two (from b@example.invalid)", result)
+        self.assertNotIn("more (max_deletes", result)
+        self.assertNotIn("(none)", result)
+
+    def test_an_empty_sender_on_the_last_record_is_kept(self):
+        reply = _reply(
+            ("TRASH", "Deleted Items", "1"),
+            ("101", "[probe] draft", ""),
+        )
+        result, _ = _run(
+            return_value=reply,
+            action="delete_permanent",
+            subject_keyword="[probe]",
+        )
+        self.assertIn("ID 101: [probe] draft\n", result)
+        self.assertNotIn("(from", result)
+        self.assertNotIn("(none)", result)
 
     def test_still_requires_a_filter(self):
         result, mock_run = _run(action="delete_permanent", dry_run=False)
