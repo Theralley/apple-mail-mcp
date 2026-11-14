@@ -59,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `include_signature`** (default on: the account's own Mail signature, as
   Mail embeds it; skipped when ambiguous).
 
+- **Skill `apple-mail-mcp`**: which tool does what, how to check that the
+  server starts, reconnect it in a running session, reinstall it from a
+  checkout, and upgrade past the `mcp<2` pin.
+
 ### Changed
 - **`manage_drafts` `delete` is allowed under `--read-only`, and never
   guesses.** Replacing a draft with a corrected copy left two drafts with

@@ -52,6 +52,8 @@ of messages a call touches:
    warm and about 15 s on a cold uv cache. Since 3.2.1 the server imports
    `FastMCP` from `fastmcp`, so no `mcp<2` pin is needed (an older install
    that fails with `No module named 'mcp.server.fastmcp'` needs an update).
+   After an update, or when the tools vanish or fail with "server closed",
+   reconnect the session; the `apple-mail-mcp` skill has the steps.
 6. **Measure.** From a checkout of this repository:
    `python3 scripts/mcp_stdio_client.py --call list_accounts '{}' -- uvx --from mcp-apple-mail mcp-apple-mail --read-only`
    prints the startup time, `tools/list` time and per-call time without

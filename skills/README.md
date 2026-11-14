@@ -12,10 +12,11 @@ their real names.
 | `apple-mail-follow-ups` | Sent mail with no reply, received mail you still owe a reply |
 | `apple-mail-safe-drafts` | Create drafts for the user to review and send in Mail |
 | `apple-mail-troubleshooting` | Timeouts, empty results, permission and startup problems |
+| `apple-mail-mcp` | Which tool does what; check, reconnect, reinstall and upgrade the server |
 
 The skills are written for a server running with `--read-only`. They call
-only tools on the read-only allowlist, and `manage_drafts` only with `create`
-and `list`. The server must be configured in Claude Code, for example as
+only tools on the read-only allowlist, and `manage_drafts` only with `create`,
+`list` and `delete`. The server must be configured in Claude Code, for example as
 `apple-mail`.
 The skills name tools without the `mcp__<server>__` prefix. Claude resolves
 them to whatever name the server is registered under.
