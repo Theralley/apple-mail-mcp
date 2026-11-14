@@ -277,7 +277,7 @@ Refused:
 - autostart, persistence and app-config folders: `~/Library/LaunchAgents`, `~/Library/LaunchDaemons`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`, `~/Library/Application Support` (incl. `com.apple.backgroundtaskmanagementagent`), `~/Library/Application Scripts`, `~/Library/Preferences`, `~/Library/Keychains`, `~/Library/Mail`, `~/Library/Containers`, ...
 - folders on `PATH`: `~/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, and `/etc`
 
-**Attachments** (`compose_email`, `reply_to_email`, ...) may be any readable file except secrets (drafts made by `manage_drafts` additionally take them only from your home or a temp folder, at most 10 files and 25 MB): `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `.env` files, `~/Library/Keychains`, and browser profiles and cookie stores (Safari, Chrome, Firefox, Edge, Brave, Arc, ...).
+**Attachments** (`compose_email`, `reply_to_email`, `manage_drafts`, ...) must be in your home or a temp folder, outside protected folders (`~/.ssh`, `~/.config`, `~/.aws`, `~/Library/Mail`, ...) and not named like a key file; drafts take at most 10 files and 25 MB. On top of that, upstream's guard refuses secrets anywhere: `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `.env` files, `~/Library/Keychains`, and browser profiles and cookie stores (Safari, Chrome, Firefox, Edge, Brave, Arc, ...).
 
 Paths are resolved (`~`, `..`, symlinks) before checking, and matching is case-insensitive like APFS.
 

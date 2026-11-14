@@ -213,6 +213,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--with 'mcp<2'` workaround is no longer needed.
 - Path guard (`paths.py`, `--write-dir`, `--attach-dir`) now also covers this
   fork's attachment saving, rich-draft output and `.eml` attachments.
+  Upstream's looser attachment rule (any readable file except named secrets)
+  is not taken: `compose_email` and `reply_to_email` keep this fork's rule
+  (home or temp folders, no `~/.config` and other protected folders), so
+  credential files such as `~/.config/rclone/rclone.conf` stay unattachable.
 - `reply_to_email(mailbox=...)`, the clipboard restore fix, the reply
   verification, `move_email`/`manage_trash` argument fixes and the localized
   and nested mailbox lookup (#140) are taken as they are.
