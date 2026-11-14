@@ -18,8 +18,9 @@ READ_ONLY = False
 # Tools registered under --read-only. This is an allowlist: any tool not named
 # here (including tools added later) is removed at startup and refused at call
 # time. Read-only means: read mail, save attachments / exports to local files,
-# fetch from the server, and create, list or delete drafts — nothing that
-# sends, moves, flags, marks, deletes received mail or creates mailboxes.
+# fetch from the server, create, list or delete drafts, and mark messages
+# read or unread by ID — nothing that sends, moves, flags, deletes received
+# mail or creates mailboxes.
 # Deleting a draft only removes something this server (or the user) wrote and
 # never sent; it refuses when more than one draft matches.
 READ_ONLY_ALLOWED_TOOLS = frozenset({
@@ -34,6 +35,9 @@ READ_ONLY_ALLOWED_TOOLS = frozenset({
     "get_email_thread",
     "get_email_source",
     "list_email_attachments",
+    "read_email_attachment",
+    "read_email",
+    "search_mail_index",
     "get_statistics",
     "get_top_senders",
     "get_awaiting_reply",
@@ -42,8 +46,11 @@ READ_ONLY_ALLOWED_TOOLS = frozenset({
     # Local files only
     "save_email_attachment",
     "export_emails",
+    "index_mail",  # writes only its own cache under ~/Library/Caches
     # Fetches new mail; changes nothing on the server
     "synchronize_account",
+    # The read flag only, by message ID (no filters, no other flags)
+    "set_email_read_status",
     # Drafts (manage_drafts only for READ_ONLY_DRAFT_ACTIONS)
     "create_rich_email_draft",
     "manage_drafts",

@@ -216,6 +216,7 @@ class EnvelopeIndex:
     BUSY_RETRIES = 5
 
     def __init__(self, path: Path):
+        self.path = path
         uri = f"file:{quote(str(path))}?mode=ro"
         # timeout makes SQLite wait out Mail's write locks (SQLITE_BUSY)
         self.conn = sqlite3.connect(uri, uri=True, timeout=2.0, check_same_thread=False)
@@ -356,6 +357,20 @@ class EnvelopeIndex:
             sql += " LIMIT -1 OFFSET ?"
             params.append(int(offset))
         return [_row_to_message(row) for row in self.query(sql, params)]
+
+    def messages_by_id(self, message_ids: Iterable[int]) -> List[Message]:
+        """The messages with these ids, in any mailbox, that Mail has not deleted."""
+        ids = [int(i) for i in message_ids]
+        found: List[Message] = []
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            rows = self.query(
+                f"SELECT {_MESSAGE_COLUMNS} {_MESSAGE_JOINS} "
+                f"WHERE m.deleted = 0 AND m.ROWID IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
+            found.extend(_row_to_message(row) for row in rows)
+        return found
 
     def count(self, mailbox_ids: Iterable[int], **filters) -> int:
         where, params = self._filters(mailbox_ids, **{**_NO_FILTERS, **filters})

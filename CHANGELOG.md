@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Local search index of Inbox and Sent: `index_mail` and
+  `search_mail_index`.** Searching through Mail with AppleScript took 4-15 s
+  per mailbox and up to 100 s (incomplete) across accounts. The index is
+  built from the Envelope Index and the `.emlx` files only (no AppleScript
+  for bodies), in SQLite FTS5 (`unicode61`, diacritics kept so å/ä/ö stay
+  letters of their own) at `~/Library/Caches/apple-mail-mcp/` (0700/0600;
+  `APPLE_MAIL_MCP_INDEX_PATH`). Newest first in committed batches within a
+  time budget, so a first run resumes; one writer at a time (flock), readers
+  never wait (WAL). Bodies not downloaded yet are counted and retried.
+  Searches top the index up first, for the scope it was built with, and skip
+  that in ~10 ms when Mail has no new message. Measured: 48,226 messages in
+  about 2.5 minutes, ~280 MB, searches 2-40 ms. Queries support prefixes,
+  phrases and `subject:`/`from:`/`to:`/`attachment:`/`body:`; every term is
+  quoted, so FTS5 syntax typed by a caller is never executed.
+- **`read_email(message_id)`**: one message by id from Mail's files (headers,
+  body text, attachment parts), without searching a mailbox.
+- **`read_email_attachment`**: an attachment or inline picture as something a
+  client can use. Pictures come back as images (HEIC/TIFF/oversized ones are
+  converted to JPEG with `sips`), PDFs as text (PDFKit), text-like files as
+  text. Allowed under `--read-only`.
+- **Attachments by message id.** `list_email_attachments(message_id=...)` and
+  `save_email_attachment(message_id=..., part=...)` work for any message in
+  any mailbox, and include inline pictures. Mail keeps most downloaded mail
+  as `.partial.emlx` with empty attachment parts; the bytes are read from
+  `Attachments/<id>/<part>/` beside it (never following a link out of Mail's
+  store), and Mail is asked to save the file only when it is not on disk.
+  Saving refuses dotfile folders and existing files unless `overwrite=True`.
+- **`manage_drafts` `create` takes `html_body`, `attachments` and
+  `include_signature`** (default on: the account's own Mail signature, as
+  Mail embeds it; skipped when ambiguous).
+
 ### Changed
 - **`manage_drafts` `delete` is allowed under `--read-only`, and never
   guesses.** Replacing a draft with a corrected copy left two drafts with
@@ -94,6 +126,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `list`. The README lists the exact set.
 
 ### Fixed
+- **Drafts were sent as a quote ("> " on every line).** On macOS 27 Mail
+  stores any body a script puts into an outgoing message (`content:`, even
+  empty, `set content`, `make new paragraph`, scripted attachments) as
+  shared content: an `Apple-Mail-URLShareWrapperClass` blockquote in the
+  HTML, and quoted plain text on send. `manage_drafts` `create`,
+  `compose_email` `mode="draft"` and `create_rich_email_draft`
+  `save_as_draft=True` now build the whole message (text, HTML, signature,
+  attachments) as an `.eml`, open it in Mail, press Message › Send Again and
+  File › Save through Accessibility (each press only after checking the item
+  and the focused window; no keystrokes), close both windows, restore the
+  previous front app, and verify the stored draft (no wrapper, body, sender,
+  attachment SHA-256, nothing new in Sent/Outbox) before reporting success.
+  Mail comes to the front for a few seconds. The old `visible:false` path is
+  gone: those compose windows could never be closed by script and re-saved
+  deleted drafts until Mail quit (the "autosaved copy" that brought back a
+  draft deleted within 20 seconds, noted under Changed, came from them).
+- **`create_rich_email_draft` wrote anywhere `output_path` pointed, and
+  reused one file per subject.** `output_path` must now be an `.eml` under the
+  home or a temp folder, outside protected folders; the default is a new
+  private file each time. `save_as_draft=True` now makes a real draft
+  instead of reporting that it could not.
 - **Timeouts on large mailboxes.** Mail answers one Apple Event per property
   read, so tools that walked a whole mailbox message by message ran into the
   120 s osascript kill on inboxes with thousands of messages. On a

@@ -257,52 +257,122 @@ def move_email(
     return result
 
 
+_SENSITIVE_HOME_DIRS = (
+    ".ssh", ".gnupg", ".config", ".aws", ".claude", ".cc-accounts", ".codex",
+    ".gemini", ".qwen", ".docker", ".kube",
+    os.path.join("Library", "LaunchAgents"),
+    os.path.join("Library", "LaunchDaemons"),
+    os.path.join("Library", "Keychains"),
+    os.path.join("Library", "Mail"),
+    os.path.join("Library", "Caches", "apple-mail-mcp"),
+)
+
+
+def _checked_save_path(save_path: str):
+    """(resolved path, None) or (None, error): under home, outside key folders."""
+    # Expand tilde (POSIX file in AppleScript does not expand ~), resolve links
+    resolved_path = os.path.realpath(os.path.expanduser(save_path))
+    home_dir = os.path.realpath(os.path.expanduser("~"))
+
+    # macOS file systems are case-insensitive: ~/.SSH is ~/.ssh
+    folded = resolved_path.casefold()
+    if not folded.startswith(home_dir.casefold() + os.sep) and folded != home_dir.casefold():
+        return None, f"Error: Save path must be under your home directory ({home_dir}). Got: {resolved_path}"
+
+    for relative in _SENSITIVE_HOME_DIRS:
+        sensitive_dir = os.path.join(home_dir, relative)
+        if folded.startswith(sensitive_dir.casefold() + os.sep) or folded == sensitive_dir.casefold():
+            return None, f"Error: Cannot save attachments to sensitive directory: {sensitive_dir}"
+    return resolved_path, None
+
+
+def _save_attachment_by_id(message_id, part, attachment_name, resolved_path: str, overwrite: bool) -> str:
+    from apple_mail_mcp import mail_attachments as ma
+
+    try:
+        item = ma.find_part(message_id, part=part, name=attachment_name)
+        target = resolved_path
+        if os.path.isdir(target):
+            safe_name = os.path.basename(item.filename).lstrip(".") or f"part-{item.part}"
+            target = os.path.join(target, safe_name)
+        if os.path.basename(target).startswith("."):
+            return "Error: will not write a hidden (dot) file"
+        if os.path.islink(target):
+            return f"Error: {target} is a symbolic link; will not write through it"
+        # The final file, not only the folder given, must be an allowed place.
+        _, path_error = _checked_save_path(target)
+        if path_error:
+            return path_error
+        if os.path.lexists(target) and not overwrite:
+            return f"Error: {target} already exists. Pass overwrite=True to replace it."
+        if not os.path.isdir(os.path.dirname(target)):
+            return f"Error: folder {os.path.dirname(target)} does not exist"
+        data = ma.part_bytes(message_id, item)
+    except ma.AttachmentError as exc:
+        return f"Error: {exc}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_TRUNC if overwrite else os.O_EXCL)
+    try:
+        fd = os.open(target, flags, 0o644)
+    except FileExistsError:
+        return f"Error: {target} already exists. Pass overwrite=True to replace it."
+    except OSError as exc:
+        return f"Error: cannot write {target}: {exc.strerror or exc}"
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    return (
+        "✓ Attachment saved successfully!\n\n"
+        f"Message ID: {message_id}\n"
+        f"Attachment: {item.filename} (part {item.part}, {item.content_type}, {ma.format_size(len(data))})\n"
+        f"Saved to: {target}"
+    )
+
+
 @mcp.tool()
 @inject_preferences
 def save_email_attachment(
-    account: str, subject_keyword: str, attachment_name: str, save_path: str
+    account: Optional[str] = None,
+    subject_keyword: Optional[str] = None,
+    attachment_name: Optional[str] = None,
+    save_path: Optional[str] = None,
+    message_id: Optional[int] = None,
+    part: Optional[str] = None,
+    overwrite: bool = False,
 ) -> str:
     """
-    Save a specific attachment from an email to disk.
+    Save an attachment or inline picture from an email to disk.
+
+    Preferred: message_id plus part (both from list_email_attachments), or
+    message_id plus attachment_name. Works in any mailbox and copies the file
+    Mail already stored on disk; only a part Mail has not downloaded yet is
+    fetched through Mail. Without message_id: the older Inbox-by-subject route.
 
     Args:
-        account: Account name (e.g., "Gmail", "Work", "Personal")
-        subject_keyword: Keyword to search for in email subjects
-        attachment_name: Name of the attachment to save
-        save_path: Full path where to save the attachment
+        account: Account name; needed without message_id
+        subject_keyword: Keyword in the subject; needed without message_id
+        attachment_name: Name (or unique part of the name) of the attachment
+        save_path: File path to write, or an existing folder to write into
+            (under your home folder, not in key or system folders)
+        message_id: Mail's message ID (preferred)
+        part: Part number from list_email_attachments, e.g. "2" or "1.2"
+        overwrite: Replace an existing file (default False; message_id route only)
 
     Returns:
         Confirmation message with save location
     """
+    if not save_path:
+        return "Error: 'save_path' is required"
+    if message_id is None and (not account or not subject_keyword or not attachment_name):
+        return (
+            "Error: pass message_id (with part or attachment_name), or account, "
+            "subject_keyword and attachment_name"
+        )
 
-    # Expand tilde in save_path (POSIX file in AppleScript does not expand ~)
-    expanded_path = os.path.expanduser(save_path)
+    resolved_path, error = _checked_save_path(save_path)
+    if error:
+        return error
 
-    # Path validation: resolve to absolute path and enforce safety constraints
-    resolved_path = os.path.realpath(expanded_path)
-    home_dir = os.path.expanduser("~")
-
-    # Must be under the user's home directory
-    if not resolved_path.startswith(home_dir + os.sep) and resolved_path != home_dir:
-        return f"Error: Save path must be under your home directory ({home_dir}). Got: {resolved_path}"
-
-    # Block sensitive directories
-    sensitive_dirs = [
-        os.path.join(home_dir, ".ssh"),
-        os.path.join(home_dir, ".gnupg"),
-        os.path.join(home_dir, ".config"),
-        os.path.join(home_dir, ".aws"),
-        os.path.join(home_dir, ".claude"),
-        os.path.join(home_dir, "Library", "LaunchAgents"),
-        os.path.join(home_dir, "Library", "LaunchDaemons"),
-        os.path.join(home_dir, "Library", "Keychains"),
-    ]
-    for sensitive_dir in sensitive_dirs:
-        if (
-            resolved_path.startswith(sensitive_dir + os.sep)
-            or resolved_path == sensitive_dir
-        ):
-            return f"Error: Cannot save attachments to sensitive directory: {sensitive_dir}"
+    if message_id is not None:
+        return _save_attachment_by_id(message_id, part, attachment_name, resolved_path, overwrite)
 
     expanded_path = resolved_path
 

@@ -1,33 +1,36 @@
 ---
 name: apple-mail-attachments
-description: Find and save email attachments from Apple Mail through the Apple Mail MCP server. Use when the user wants a file someone emailed them, such as an invoice PDF, a contract or a spreadsheet, or asks what attachments a message has, or asks to save an attachment to disk.
+description: Find, read and save email attachments and inline pictures from Apple Mail through the Apple Mail MCP server. Use when the user wants a file someone emailed them, such as an invoice PDF, a contract or a spreadsheet, asks what a PDF or picture in an email says or shows, asks what attachments a message has, or asks to save an attachment to disk.
 ---
 
-# Retrieve an Apple Mail attachment
+# Read or save an Apple Mail attachment
 
 ## Workflow
 
-1. **Find the message.** Start with
+1. **Find the message and its ID.** Fastest:
+   `search_mail_index(query="attachment:<name or word> <other words>")`
+   (run `index_mail()` once first if it says there is no index). Or
    `search_emails(account="<name>", subject_keyword="<keyword>", output_format="json", limit=10)`.
-   Add `sender=` or `date_from=` to narrow it. Note the exact subject of the
-   right message.
-2. **List its attachments.**
-   `list_email_attachments(account="<name>", subject_keyword="<exact subject fragment>", max_results=3)`
-   returns each attachment's name and size in KB. Check that it is the
-   message the user means (sender and date) before you save anything.
-3. **Save.** Ask where to save if the user has not said, then call
-   `save_email_attachment(account="<name>", subject_keyword="<subject fragment>", attachment_name="<file name>", save_path="~/Downloads/<file name>")`.
-   `save_path` must be a full file path under the home directory. The tool
-   refuses sensitive directories such as `~/.ssh` and `~/.config`.
-4. **Confirm.** Report the saved path. Open or read the file only if the user
-   asks.
+   Check sender and date so it is the message the user means.
+2. **List its parts.** `list_email_attachments(message_id=<id>)` lists every
+   attachment and inline picture with its part number, type and size, and
+   says when one is not downloaded yet.
+3. **Read it** when the user wants to know what it says or shows:
+   `read_email_attachment(message_id=<id>, part="<part>")`. Pictures come back
+   as images, PDFs and text files as text. Docx, xlsx and zip cannot be read
+   here; save them instead.
+4. **Save it** when the user wants the file. Ask where if they have not said,
+   then `save_email_attachment(message_id=<id>, part="<part>", save_path="~/Downloads/")`.
+   A folder keeps the attachment's own name. It refuses paths outside the
+   home folder, dotfile folders such as `~/.ssh`, and existing files unless
+   `overwrite=true`.
+5. **Confirm.** Report what you read or the saved path.
 
 ## Rules
 
-- Both attachment tools match on subject substring in the inbox and use the
-  first hit. Use a subject fragment unique enough to pick the right message.
-- Do not use `search_emails(has_attachments=true)` to find candidates. Mail
-  cannot evaluate that filter server-side, and it returns no results. Use
-  step 2 instead.
-- Attachments can contain personal or financial data. Save them only where
-  the user asked.
+- Prefer `message_id` over `subject_keyword`. The subject form searches the
+  inbox only and takes the first message whose subject contains the words.
+- A scanned PDF has little or no text layer; the tool says so. Save it and
+  let the user open it instead of guessing its content.
+- Attachments can contain personal or financial data. Quote only what the
+  user asked for, and save files only where the user asked.

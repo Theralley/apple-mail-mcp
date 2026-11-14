@@ -24,21 +24,62 @@ from apple_mail_mcp.emlx import get_message_body, preview
 @mcp.tool()
 @inject_preferences
 def list_email_attachments(
-    account: str,
-    subject_keyword: str,
-    max_results: int = 1
+    account: Optional[str] = None,
+    subject_keyword: Optional[str] = None,
+    max_results: int = 1,
+    message_id: Optional[int] = None,
 ) -> str:
     """
-    List attachments for emails matching a subject keyword.
+    List the attachments and inline pictures of an email.
+
+    Preferred: pass message_id (the ID shown by search_emails, list_inbox_emails,
+    get_email_thread or search_mail_index). That works in any mailbox (Inbox,
+    Sent, folders), lists inline pictures too, gives each part a number for
+    read_email_attachment / save_email_attachment, and reads Mail's files on
+    disk instead of asking Mail.
+
+    Without message_id, the older behaviour: Inbox only, matched by subject.
 
     Args:
-        account: Account name (e.g., "Gmail", "Work", "Personal")
-        subject_keyword: Keyword to search for in email subjects
+        account: Account name (e.g., "Gmail", "Work"); needed without message_id
+        subject_keyword: Keyword in the subject; needed without message_id
         max_results: Maximum number of matching emails to check (default: 1)
+        message_id: Mail's message ID; when given, account and subject are ignored
 
     Returns:
-        List of attachments with their names and sizes
+        List of attachments with part number, name, type and size
     """
+    if message_id is not None:
+        return _list_attachments_by_id(message_id)
+    if not account or not subject_keyword:
+        return "Error: pass message_id, or account and subject_keyword"
+    return _list_attachments_by_subject(account, subject_keyword, max_results)
+
+
+def _list_attachments_by_id(message_id) -> str:
+    from apple_mail_mcp import mail_attachments as ma
+
+    try:
+        parts = ma.list_parts(message_id)
+    except ma.AttachmentError as exc:
+        return f"Error: {exc}"
+    lines = [f"ATTACHMENTS OF MESSAGE {message_id}", ""]
+    if not parts:
+        lines.append("No attachments or inline pictures.")
+        return "\n".join(lines)
+    for item in parts:
+        kind = "inline picture" if item.is_inline_picture else item.content_type
+        state = "" if item.source != "missing" else " — not downloaded yet"
+        lines.append(f"📎 part {item.part}: {item.filename} ({kind}, {ma.format_size(item.size)}){state}")
+    lines += [
+        "",
+        f"FOUND: {len(parts)} part(s). Read one with read_email_attachment(message_id={message_id}, part=\"<part>\"), "
+        "or save it with save_email_attachment(message_id=..., part=..., save_path=...).",
+    ]
+    return "\n".join(lines)
+
+
+def _list_attachments_by_subject(account: str, subject_keyword: str, max_results: int) -> str:
 
     # Escape for AppleScript
     escaped_keyword = escape_applescript(subject_keyword)

@@ -6,12 +6,16 @@ import tempfile
 import re
 from email.message import EmailMessage
 from html import escape as html_escape
+from email.headerregistry import Address
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
-from apple_mail_mcp import server
+from apple_mail_mcp import draft_gui, draft_mime, emlx, server
+from apple_mail_mcp import envelope_index as ei
 from apple_mail_mcp.server import mcp
 from apple_mail_mcp.core import (
+    AS_FIELD_SEP,
+    FIELD_SEP,
     inject_preferences,
     escape_applescript,
     run_applescript,
@@ -34,10 +38,26 @@ def _safe_eml_name(subject):
 
 
 def _default_rich_draft_path(subject):
-    """Return default output path for generated rich draft EML files."""
+    """A new private file for a generated rich draft (never an existing one)."""
     drafts_dir = Path.home() / "Library" / "Caches" / "apple-mail-mcp" / "rich-drafts"
     drafts_dir.mkdir(parents=True, exist_ok=True)
-    return drafts_dir / (_safe_eml_name(subject) + ".eml")
+    os.chmod(drafts_dir, 0o700)
+    fd, name = tempfile.mkstemp(prefix=_safe_eml_name(subject) + "-", suffix=".eml", dir=drafts_dir)
+    os.close(fd)
+    return Path(name)
+
+
+def _checked_rich_draft_path(output_path):
+    """(path, error): an .eml path the caller may write, inside the allowed folders."""
+    if not str(output_path).lower().endswith(".eml"):
+        return None, "Error: 'output_path' must end in .eml"
+    try:
+        resolved = draft_mime.checked_local_path(str(output_path), what="output_path")
+    except draft_mime.DraftError as exc:
+        return None, f"Error: {exc}"
+    if os.path.isdir(resolved):
+        return None, f"Error: 'output_path' {output_path!r} is a folder"
+    return Path(output_path).expanduser(), None
 
 
 def _account_default_alias_if_single(account):
@@ -233,13 +253,6 @@ def _prepare_rich_bodies(subject, text_body, html_body):
     return plain_body, rich_body, []
 
 
-_SAVE_AS_DRAFT_UNSUPPORTED_NOTE = (
-    "save_as_draft could not be honored: Mail opens a `.eml` file as a read-only message "
-    "viewer, not a compose object, so there is no draft for Mail to save here. Use "
-    "compose_email(mode=\"draft\") or manage_drafts for a real, sendable HTML draft instead."
-)
-
-
 @mcp.tool()
 @inject_preferences
 def create_rich_email_draft(
@@ -269,12 +282,11 @@ def create_rich_email_draft(
         html_body: Optional HTML body. If omitted but text_body is provided, a basic HTML wrapper is generated.
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
-        output_path: Optional path for the generated `.eml` file
+        output_path: Optional path for the generated `.eml` file (must end in .eml, inside your home folder or a temp folder)
         open_in_mail: If True, open the generated `.eml` in Mail (default: True)
-        save_as_draft: Not currently supported. Mail opens a `.eml` as a read-only message
-            viewer, not a compose object, so it can never be saved into Drafts this way.
-            Passing True is reported honestly in the output rather than silently ignored;
-            use `compose_email(mode="draft")` or `manage_drafts` for a real, sendable draft.
+        save_as_draft: If True, save a real draft in the account's Drafts mailbox instead,
+            exactly as manage_drafts(action="create") does (with the account's signature;
+            needs subject, to and a body). No `.eml` viewer is left open.
         from_address: Optional sender address to stamp into the `.eml` `From:` header. Must be one of the account's configured email addresses. When omitted, Mail fills the account's default "Send new messages from" address on open.
 
     Returns:
@@ -285,6 +297,23 @@ def create_rich_email_draft(
 
     text_body = _strip_cdata_wrappers(text_body)
     html_body = _strip_cdata_wrappers(html_body)
+
+    if save_as_draft:
+        return _create_clean_draft(
+            account,
+            subject=subject,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            text_body=text_body,
+            html_body=html_body,
+            from_address=from_address,
+        )
+
+    if output_path:
+        draft_path, path_error = _checked_rich_draft_path(output_path)
+        if path_error:
+            return path_error
 
     sender_override, sender_error = _validate_from_address(account, from_address)
     if sender_error:
@@ -321,16 +350,12 @@ def create_rich_email_draft(
     message.set_content(plain_body)
     message.add_alternative(rich_body, subtype="html")
 
-    draft_path = (
-        Path(output_path).expanduser()
-        if output_path
-        else _default_rich_draft_path(subject)
-    )
+    if not output_path:
+        draft_path = _default_rich_draft_path(subject)
     draft_path.parent.mkdir(parents=True, exist_ok=True)
     draft_path.write_bytes(bytes(message))
 
     opened = False
-    save_requested = open_in_mail and save_as_draft
     if open_in_mail:
         subprocess.run(["open", "-a", "Mail", str(draft_path)], check=True)
         opened = True
@@ -341,9 +366,7 @@ def create_rich_email_draft(
     output_lines.append("EML path: " + str(draft_path))
     output_lines.append("Opened in Mail: " + ("yes" if opened else "no"))
     if open_in_mail:
-        output_lines.append("Saved in Drafts: no")
-        if save_requested:
-            output_lines.append("Note: " + _SAVE_AS_DRAFT_UNSUPPORTED_NOTE)
+        output_lines.append("Saved in Drafts: no (use save_as_draft=True for a real draft)")
     if sender_address:
         output_lines.append("From: " + sender_address)
     if recipients_to:
@@ -988,7 +1011,7 @@ def compose_email(
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
         attachments: Optional file paths to attach, comma-separated for multiple (e.g., "/path/to/file1.png,/path/to/file2.pdf")
-        mode: Delivery mode — "send" (send immediately, default), "draft" (save silently to Drafts), or "open" (open compose window for review before sending)
+        mode: Delivery mode — "send" (send immediately, default), "draft" (save to Drafts exactly as manage_drafts(action="create") does; Mail comes to the front for a few seconds), or "open" (open compose window for review before sending)
         body_html: Optional HTML body for rich formatting (bold, headings, links, colors). When provided, the email is sent as HTML. The plain 'body' field is still required as fallback text.
         from_address: Optional sender address to use for this message. Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
 
@@ -1005,6 +1028,21 @@ def compose_email(
 
     body = _strip_cdata_wrappers(body) or ""
     body_html = _strip_cdata_wrappers(body_html)
+
+    if mode == "draft":
+        # A body scripted into an outgoing message is stored as quoted
+        # "shared content"; drafts go through Mail's own compose window.
+        return _create_clean_draft(
+            account,
+            subject=subject,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            text_body=body or None,
+            html_body=body_html,
+            attachments=attachments,
+            from_address=from_address,
+        )
 
     # Validate optional sender override
     sender_override, sender_error = _validate_from_address(account, from_address)
@@ -1453,6 +1491,130 @@ def _drafts_matching(safe_account: str, draft_subject: str):
     return matches
 
 
+def _account_identity(account):
+    """(full name, [addresses]) of a Mail account, addresses in Mail's order."""
+    safe_account = escape_applescript(account)
+    script = f'''
+    tell application "Mail"
+        try
+            set targetAccount to account "{safe_account}"
+            set fullName to ""
+            try
+                set fn to full name of targetAccount
+                if fn is not missing value then set fullName to fn as text
+            end try
+            set AppleScript's text item delimiters to {AS_FIELD_SEP}
+            set addrText to (email addresses of targetAccount) as text
+            set AppleScript's text item delimiters to ""
+            return "ID" & {AS_FIELD_SEP} & fullName & {AS_FIELD_SEP} & addrText
+        on error
+            return ""
+        end try
+    end tell
+    '''
+    # Fields are separated by the unit separator, which output cleaning keeps
+    # (an empty name would otherwise vanish with the stripped whitespace).
+    fields = (run_applescript(script) or "").split(FIELD_SEP)
+    if len(fields) < 2 or fields[0].strip() != "ID":
+        return "", []
+    full_name = fields[1].strip()
+    addresses = [field.strip() for field in fields[2:] if field.strip()]
+    return full_name, addresses
+
+
+def _create_clean_draft(
+    account,
+    *,
+    subject,
+    to,
+    cc=None,
+    bcc=None,
+    text_body=None,
+    html_body=None,
+    attachments=None,
+    from_address=None,
+    include_signature=True,
+):
+    """Save a draft through Mail's own compose window (see draft_gui). Never sends."""
+    if not subject or not subject.strip() or not to or not (text_body or html_body):
+        return "Error: 'subject', 'to', and 'body' (or 'html_body') are required for creating drafts"
+    subject = subject.strip()
+    try:
+        loaded = draft_mime.load_attachments(attachments)
+    except draft_mime.DraftError as exc:
+        return f"Error: {exc}"
+
+    full_name, addresses = _account_identity(account)
+    if not addresses:
+        return f"Error: Could not read email addresses for account {account!r}."
+    if from_address and from_address.strip():
+        sender_address = {a.lower(): a for a in addresses}.get(from_address.strip().lower())
+        if not sender_address:
+            return (
+                f"Error: 'from_address' {from_address.strip()!r} is not configured on account "
+                f"{account!r}. Known addresses: {', '.join(addresses)}"
+            )
+    else:
+        sender_address = addresses[0]
+    try:
+        sender = str(Address(display_name=full_name, addr_spec=sender_address)) if full_name else sender_address
+    except (ValueError, IndexError):
+        sender = sender_address
+
+    try:
+        account_uuid = ei.account_uuid(account)
+    except ei.IndexUnavailable as exc:
+        return f"Error: Mail's index does not know account {account!r} ({exc}); the draft could not be checked, so none was made."
+
+    signature, signature_note = None, "none (include_signature=False)"
+    if include_signature:
+        signature, signature_note = draft_mime.resolve_signature(account_uuid)
+
+    try:
+        msg = draft_mime.build_draft(
+            subject=subject, sender=sender, to=to, cc=cc, bcc=bcc,
+            text_body=text_body, html_body=html_body, attachments=loaded, signature=signature,
+        )
+    except draft_mime.DraftError as exc:
+        return f"Error: {exc}"
+
+    # Mail keeps only the HTML of a draft, so check against what the HTML says.
+    plain_check = emlx.html_to_text(draft_mime.html_fragment(html_body)) if html_body else text_body
+    result = draft_gui.create_in_mail(
+        msg,
+        account_uuid=account_uuid,
+        subject=subject,
+        plain_body=plain_check,
+        attachments=[(item.filename, item.sha256) for item in loaded],
+        sender=sender_address,
+    )
+
+    lines = ["CREATING DRAFT", ""]
+    if result.ok:
+        lines.append(f"✓ Draft saved in Drafts (ID {result.draft_id}). It was not sent.")
+    elif result.draft_id is not None:
+        lines.append(f"⚠ Draft saved in Drafts (ID {result.draft_id}), but check it in Mail before sending.")
+    else:
+        lines.append("Error: the draft was not created.")
+    lines.extend(result.lines)
+    lines.append("")
+    lines.append(f"Subject: {subject}")
+    lines.append(f"From: {sender}")
+    lines.append(f"To: {msg['To']}")
+    if msg["Cc"]:
+        lines.append(f"CC: {msg['Cc']}")
+    if msg["Bcc"]:
+        lines.append(f"BCC: {msg['Bcc']}")
+    if loaded:
+        lines.append("Attachments: " + ", ".join(
+            f"{item.filename} ({len(item.data):,} bytes)" for item in loaded))
+    lines.append(f"Signature: {signature_note}")
+    if result.eml_path is not None:
+        lines.append(f"The finished message is kept at {result.eml_path}; open it in Mail and "
+                     "use Message > Send Again to get an editable copy.")
+    return "\n".join(lines)
+
+
 @mcp.tool()
 @inject_preferences
 def manage_drafts(
@@ -1466,23 +1628,37 @@ def manage_drafts(
     draft_subject: Optional[str] = None,
     from_address: Optional[str] = None,
     draft_id: Optional[int] = None,
+    html_body: Optional[str] = None,
+    attachments: Optional[Union[str, List[str]]] = None,
+    include_signature: bool = True,
 ) -> str:
     """
     Manage draft emails - list, create, send, open, or delete drafts.
 
     Under --read-only only "create", "list" and "delete" are allowed.
 
+    action="create" saves a real draft in the account's Drafts mailbox, with
+    the account's own Mail signature and any attachments, and never sends it.
+    Mail comes to the front for a few seconds while it saves the draft, then
+    the app you were in gets the front back; don't type meanwhile. The stored
+    draft is read back and checked (body, sender, attachments, and no "> "
+    quoting) before success is reported. If Mail cannot do it, the finished
+    message is left as an .eml file whose path is returned.
+
     Args:
         account: Account name (e.g., "Gmail", "Work")
         action: Action to perform: "list", "create", "send", "open", "delete". Use "open" to open a draft in a visible compose window for review before sending.
         subject: Email subject (required for create)
         to: Recipient email(s) for create (comma-separated)
-        body: Email body (required for create)
+        body: Plain-text email body (create; this or html_body is required)
         cc: Optional CC recipients for create
         bcc: Optional BCC recipients for create
         draft_subject: Subject keyword to find draft (required for send/open/delete)
-        from_address: Optional sender address for new drafts (action="create"). Must be one of the account's configured email addresses. When omitted, Mail uses the account's default "Send new messages from" setting.
+        from_address: Optional sender address for new drafts (action="create"). Must be one of the account's configured email addresses. When omitted, the account's first address is used.
         draft_id: Exact draft ID as shown by action="list" (delete only). Required when several drafts match draft_subject; delete never guesses between them.
+        html_body: Optional HTML body for create, instead of or with body (body is then the plain-text version)
+        attachments: Files to attach for create: a list of paths, or one string with paths separated by commas or new lines. At most 10 files and 25 MB, from your home folder or a temp folder.
+        include_signature: Add the account's Mail signature (create; default True). Skipped when the account has several signatures and none is selected.
 
     Returns:
         Formatted output based on action
@@ -1529,83 +1705,18 @@ def manage_drafts(
         '''
 
     elif action == "create":
-        if not subject or not to or not body:
-            return "Error: 'subject', 'to', and 'body' are required for creating drafts"
-
-        sender_override, sender_error = _validate_from_address(account, from_address)
-        if sender_error:
-            return sender_error
-
-        escaped_subject = escape_applescript(subject)
-        escaped_body = escape_applescript(body)
-        safe_to = escape_applescript(to)
-
-        sender_script = _compose_sender_script(
-            "newDraft", "targetAccount", sender_override
+        return _create_clean_draft(
+            account,
+            subject=subject,
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            text_body=body,
+            html_body=_strip_cdata_wrappers(html_body),
+            attachments=attachments,
+            from_address=from_address,
+            include_signature=include_signature,
         )
-
-        # Build TO recipients (split comma-separated)
-        to_script = ""
-        to_addresses = [addr.strip() for addr in to.split(",")]
-        for addr in to_addresses:
-            safe_addr = escape_applescript(addr)
-            to_script += f'''
-                    make new to recipient at end of to recipients with properties {{address:"{safe_addr}"}}
-            '''
-
-        # Build CC recipients if provided
-        cc_script = ""
-        if cc:
-            cc_addresses = [addr.strip() for addr in cc.split(",")]
-            for addr in cc_addresses:
-                safe_addr = escape_applescript(addr)
-                cc_script += f'''
-                    make new cc recipient at end of cc recipients with properties {{address:"{safe_addr}"}}
-                '''
-
-        # Build BCC recipients if provided
-        bcc_script = ""
-        if bcc:
-            bcc_addresses = [addr.strip() for addr in bcc.split(",")]
-            for addr in bcc_addresses:
-                safe_addr = escape_applescript(addr)
-                bcc_script += f'''
-                    make new bcc recipient at end of bcc recipients with properties {{address:"{safe_addr}"}}
-                '''
-
-        script = f'''
-        tell application "Mail"
-            set outputText to "CREATING DRAFT" & return & return
-
-            try
-                set targetAccount to account "{safe_account}"
-
-                -- Create new outgoing message (draft)
-                set newDraft to make new outgoing message with properties {{subject:"{escaped_subject}", content:"{escaped_body}", visible:false}}
-
-                {sender_script}
-
-                -- Add recipients
-                tell newDraft
-                    {to_script}
-                    {cc_script}
-                    {bcc_script}
-                end tell
-
-                -- Save to drafts (don't send)
-                -- The draft is automatically saved to Drafts folder
-
-                set outputText to outputText & "✓ Draft created successfully!" & return & return
-                set outputText to outputText & "Subject: {escaped_subject}" & return
-                set outputText to outputText & "To: {safe_to}" & return
-
-            on error errMsg
-                return "Error: " & errMsg
-            end try
-
-            return outputText
-        end tell
-        '''
 
     elif action == "send":
         if not draft_subject:

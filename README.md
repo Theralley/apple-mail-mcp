@@ -92,7 +92,7 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 
 </details>
 
-## Tools (22)
+## Tools (31)
 
 ### Reading & Search
 | Tool | Description |
@@ -103,6 +103,13 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `list_accounts` | List all configured Mail accounts |
 | `search_emails` | Unified search — subject, sender, body text, dates, attachments, flag status/color, cross-account |
 | `get_email_thread` | Conversation thread view |
+| `read_email` | Read one email by its message ID from Mail's files (headers, body, attachment parts) |
+
+### Local search index (Inbox and Sent)
+| Tool | Description |
+|------|-------------|
+| `index_mail` | Build or update a full-text index of Inbox and Sent on this Mac (newest first, resumable) |
+| `search_mail_index` | Search it in milliseconds: subject, people, attachment names and body text, with filters |
 
 ### Organization
 | Tool | Description |
@@ -119,14 +126,15 @@ claude mcp add apple-mail -- /bin/bash $(pwd)/start_mcp.sh
 | `compose_email` | Send new emails (plain text or HTML body) |
 | `reply_to_email` | Reply or reply-all with optional HTML body |
 | `forward_email` | Forward with optional message, CC/BCC |
-| `manage_drafts` | Create, list, send, and delete drafts |
-| `create_rich_email_draft` | Build a rich HTML `.eml` draft, open it in Mail, and optionally save it to Drafts |
+| `manage_drafts` | Create (with signature and attachments), list, send, and delete drafts |
+| `create_rich_email_draft` | Build a rich HTML `.eml` file and open it in Mail, or save it as a real draft (`save_as_draft=True`) |
 
 ### Attachments
 | Tool | Description |
 |------|-------------|
-| `list_email_attachments` | List attachments with names and sizes |
-| `save_email_attachment` | Save attachments to disk |
+| `list_email_attachments` | List attachments and inline pictures, by message ID (with part numbers) or by subject |
+| `read_email_attachment` | Read an attachment or inline picture: pictures as images, PDFs and text files as text |
+| `save_email_attachment` | Save an attachment to disk, by message ID and part or by subject and name |
 
 ### Smart Inbox
 | Tool | Description |
@@ -150,14 +158,27 @@ Pass `--read-only` to restrict the server to reading mail, saving attachments an
 
 | Allowed under `--read-only` | Tools |
 |---|---|
-| Read | `list_accounts`, `list_account_addresses`, `list_mailboxes`, `list_inbox_emails`, `get_mailbox_unread_counts`, `get_inbox_overview`, `search_emails`, `get_email_thread`, `get_email_source`, `list_email_attachments`, `get_statistics`, `get_top_senders`, `get_awaiting_reply`, `get_needs_response`, `inbox_dashboard` |
-| Write local files only | `save_email_attachment`, `export_emails` |
+| Read | `list_accounts`, `list_account_addresses`, `list_mailboxes`, `list_inbox_emails`, `get_mailbox_unread_counts`, `get_inbox_overview`, `search_emails`, `get_email_thread`, `get_email_source`, `read_email`, `list_email_attachments`, `read_email_attachment`, `search_mail_index`, `get_statistics`, `get_top_senders`, `get_awaiting_reply`, `get_needs_response`, `inbox_dashboard` |
+| Write local files only | `save_email_attachment`, `export_emails`, `index_mail` (its own cache) |
 | Fetch new mail | `synchronize_account` |
 | Drafts | `create_rich_email_draft`, `manage_drafts` with `action` `create`, `list` or `delete` only. `delete` removes one draft: it refuses when more than one draft matches `draft_subject` and lists them, so pass `draft_id` (shown by `list`) |
 
 Blocked: `compose_email`, `reply_to_email`, `forward_email`, `move_email`, `update_email_status`, `manage_trash` (every action), `create_mailbox`, and `manage_drafts` `send` and `open`.
 
-Mail autosaves a draft created with `manage_drafts` `create` once, about 20 seconds after it is created, as a new message. A draft deleted before that comes back as that autosaved copy. Wait half a minute after creating before deleting, and `list` again afterwards.
+#### How drafts are made
+
+On macOS 27 Mail stores any body that a script puts into an outgoing message as "shared content": the HTML gets an `Apple-Mail-URLShareWrapperClass` blockquote and, when the draft is sent, every line of the plain-text part starts with "> ". That happens with `content`, `set content`, `make new paragraph` and scripted attachments alike. A compose window made with `visible:false` can also never be closed by script and keeps saving its draft until Mail quits.
+
+So `manage_drafts` `create` (and `compose_email` `mode="draft"`, and `create_rich_email_draft` `save_as_draft=True`) never script a body. The server builds the whole message itself (text and HTML, the account's own Mail signature, attachments), saves it as a private `.eml` file, and lets Mail turn it into a draft:
+
+1. Mail opens the `.eml` in the background (a read-only viewer) and comes to the front for a few seconds.
+2. The server presses **Message › Send Again** on that viewer, only after checking that the menu item really reads "Send Again" and that the focused window is that viewer (in a compose window the same item is Send). Mail opens an ordinary compose window holding exactly that message.
+3. It presses **File › Save** on that compose window, again only after checking it is the focused window, and closes it. Then it closes the viewer and gives the front back to the app that had it.
+4. It reads the stored draft back from disk and checks it: no quote wrapper, the body text, the sender, each attachment's SHA-256, and that nothing with that subject appeared in Sent or Outbox.
+
+Only accessibility presses are used, never typed keystrokes, so nothing can land in another app. If a check fails before a press, nothing is pressed; the `.eml` file is kept and its path returned. This needs **Accessibility** permission for the app that runs the server (System Settings › Privacy & Security › Accessibility). Don't type while Mail is in front. Attachments must be in your home folder or a temp folder (not `~/.ssh`, `~/.config`, Mail's own store and similar), at most 10 files and 25 MB.
+
+The signature is the one Mail uses for the account (`~/Library/Mail/V10/MailData/Signatures`, chosen per account in Mail's settings). It is left out when the account has several signatures and none is selected, or with `include_signature=False`.
 
 ```json
 {
@@ -202,6 +223,18 @@ Batch operations have conservative defaults to prevent accidental bulk actions:
 
 Override via function parameters when needed.
 
+### Attachments and inline pictures
+
+Mail often keeps a downloaded message as a `.partial.emlx` whose attachment parts are empty; the bytes are in `Attachments/<message id>/<part>/` next to it. `list_email_attachments(message_id=...)`, `read_email_attachment` and `save_email_attachment(message_id=..., part=...)` read both places directly (and ask Mail to save the file only when it is not on disk yet), so they work for any message by ID, in any mailbox, including pictures embedded in the body. `read_email_attachment` returns pictures as images (HEIC, TIFF and very large pictures are converted to JPEG locally with `sips`), PDFs as text (PDFKit; a scanned PDF without a text layer returns little text), and text-like files as text.
+
+### Local search index
+
+`index_mail` builds a full-text index of every account's Inbox and Sent from Mail's own database and message files: no AppleScript for bodies, nothing sent anywhere. It is stored in `~/Library/Caches/apple-mail-mcp/mail-index.sqlite3` (folder 0700, file 0600; `APPLE_MAIL_MCP_INDEX_PATH` moves it) and holds message text, so `index_mail(delete_index=True)` removes it. The newest mail is indexed first in batches, so a first run that hits its time budget (`max_seconds`, default 120) continues on the next run; later runs only add what is new, and `search_mail_index` tops it up by itself (a check costs about 10 ms when nothing is new; deletions and moves are picked up by a full comparison every 10 minutes).
+
+Measured on a Mac with five accounts: 48,226 Inbox and Sent messages indexed in about 2.5 minutes, about 280 MB on disk; searches take 2–40 ms, against 4–15 s per mailbox (up to 100 s across accounts) for Mail's own search through AppleScript.
+
+Queries: words are ANDed and matched whole, case-insensitively; å, ä and ö are kept as letters of their own. `offer*` is a prefix, `"two words"` a phrase, and `subject:`, `from:`, `to:`, `attachment:` or `body:` limit a word to one field. Filters: `folder`, `account`, `sender`, `date_from`/`date_to`, `has_attachment`; `sort="relevance"` ranks by match instead of date.
+
 ## Usage Examples
 
 ```
@@ -217,9 +250,9 @@ Create a rich HTML draft for a weekly update and open it in Mail
 
 Use `create_rich_email_draft` when you need a visually formatted email, newsletter, or leadership update.
 
-- It generates an unsent `.eml` file with multipart plain-text + HTML bodies
-- It can open the draft directly in Mail for editing
-- It can optionally ask Mail to save the opened compose window into Drafts
+- It generates an unsent `.eml` file with multipart plain-text + HTML bodies (a new private file under `~/Library/Caches/apple-mail-mcp/rich-drafts/` unless `output_path`, an `.eml` path under your home or a temp folder, is given)
+- It can open that file in Mail (a read-only viewer; Message › Send Again makes an editable copy)
+- With `save_as_draft=True` it saves a real draft in Drafts instead, exactly like `manage_drafts` `create`
 - It accepts partial details, so you can start with just an account and subject and fill in the rest later
 
 This is more reliable than injecting raw HTML into AppleScript `content`, which Mail often stores as literal markup.
@@ -249,7 +282,10 @@ cp -r plugin/skills/email-management ~/.claude/skills/email-management
 | Slow searches | Set `include_content: false` and lower `max_results` |
 | Mailbox not found | Use exact folder names; nested folders use `/` separator (e.g., `Projects/Alpha`) |
 | Permission errors | Grant access in **System Settings > Privacy & Security > Automation** |
-| Rich draft shows raw HTML | Use `create_rich_email_draft` instead of pasting HTML into `manage_drafts` or AppleScript `content` |
+| Rich draft shows raw HTML | Pass the HTML as `html_body` to `manage_drafts` `create` |
+| Sent mail arrives with every line quoted ("> ") | The draft was made by a script setting `content` (older versions of this server). Drafts made now go through Send Again, see "How drafts are made" |
+| "Mail did not create the draft" | The reason is given; usually another window took the focus, or the app running the server lacks Accessibility permission. The finished `.eml` is kept and its path returned |
+| Slow mail searches | Run `index_mail` once and use `search_mail_index` |
 
 ## Project Structure
 
@@ -261,7 +297,7 @@ apple-mail-mcp/
 │   ├── .claude-plugin/
 │   │   └── plugin.json        # Plugin manifest
 │   ├── skills/                # Email Management Expert skill (also invocable as /email-management)
-│   ├── apple_mail_mcp/        # Python MCP server package (24 tools)
+│   ├── apple_mail_mcp/        # Python MCP server package (31 tools)
 │   ├── apple_mail_mcp.py      # Entry point
 │   ├── start_mcp.sh           # Startup wrapper (auto-creates venv)
 │   └── requirements.txt

@@ -70,30 +70,48 @@ class ComposeToolTests(unittest.TestCase):
             self.assertIn("Missing details: subject, to, body", result)
             self.assertIn("Opened in Mail: no", result)
 
-    def test_create_rich_email_draft_reports_save_as_draft_honestly(self):
-        # An opened `.eml` is a read-only Mail viewer, not a compose object, so
-        # save_as_draft can never actually succeed (#83) — the tool must say so
-        # plainly instead of implying the draft was saved.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            output_path = Path(tmpdir) / "saved.eml"
+    def test_create_rich_email_draft_save_as_draft_makes_a_real_draft(self):
+        # save_as_draft used to be unsupported (#83): an opened `.eml` is a
+        # read-only viewer. It now goes through the same path as manage_drafts.
+        with (
+            patch("apple_mail_mcp.tools.compose._create_clean_draft", return_value="DRAFT OK") as create,
+            patch("apple_mail_mcp.tools.compose.subprocess.run") as mock_run,
+        ):
+            result = compose_tools.create_rich_email_draft(
+                account="Work",
+                subject="Saved Draft",
+                to="team@example.com",
+                html_body="<p>Hi</p>",
+                open_in_mail=True,
+                save_as_draft=True,
+            )
 
-            with (
-                patch(
-                    "apple_mail_mcp.tools.compose.run_applescript",
-                    return_value="sender@example.com",
-                ),
-                patch("apple_mail_mcp.tools.compose.subprocess.run"),
-            ):
+        self.assertEqual(result, "DRAFT OK")
+        mock_run.assert_not_called()
+        self.assertEqual(create.call_args.kwargs["html_body"], "<p>Hi</p>")
+
+    def test_create_rich_email_draft_refuses_output_path_outside_allowed_folders(self):
+        with patch("apple_mail_mcp.tools.compose.run_applescript", return_value="a@example.com"):
+            for bad in ("/etc/x.eml", "~/.ssh/x.eml", "~/notes.txt"):
                 result = compose_tools.create_rich_email_draft(
-                    account="Work",
-                    subject="Saved Draft",
-                    output_path=str(output_path),
-                    open_in_mail=True,
-                    save_as_draft=True,
-                )
+                    account="Work", subject="S", output_path=bad, open_in_mail=False)
+                self.assertTrue(result.startswith("Error:"), (bad, result))
 
-            self.assertIn("Saved in Drafts: no", result)
-            self.assertIn("save_as_draft could not be honored", result)
+    def test_create_rich_email_draft_default_paths_never_collide(self):
+        with patch("apple_mail_mcp.tools.compose.run_applescript", return_value="a@example.com"):
+            paths = []
+            for _ in range(2):
+                result = compose_tools.create_rich_email_draft(
+                    account="Work", subject="Same subject", to="t@example.com",
+                    text_body="x", open_in_mail=False)
+                line = next(l for l in result.splitlines() if l.startswith("EML path: "))
+                paths.append(Path(line[len("EML path: "):]))
+        try:
+            self.assertNotEqual(paths[0], paths[1])
+            self.assertTrue(all(p.exists() for p in paths))
+        finally:
+            for p in paths:
+                p.unlink(missing_ok=True)
 
     def test_create_rich_email_draft_omits_save_note_when_not_requested(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -250,7 +268,7 @@ class ComposeEmailSenderOverrideTests(unittest.TestCase):
                 to="self@example.com",
                 subject="Test",
                 body="Body",
-                mode="draft",
+                mode="open",
             )
 
         self.assertEqual(len(captured), 1)
@@ -280,7 +298,7 @@ class ComposeEmailSenderOverrideTests(unittest.TestCase):
                 to="self@example.com",
                 subject="Test",
                 body="Body",
-                mode="draft",
+                mode="open",
                 from_address="secondary@example.org",
             )
 
@@ -307,7 +325,7 @@ class ComposeEmailSenderOverrideTests(unittest.TestCase):
                 to="self@example.com",
                 subject="Test",
                 body="Body",
-                mode="draft",
+                mode="open",
                 from_address="unknown@example.com",
             )
 
@@ -581,85 +599,123 @@ class ForwardEmailSenderOverrideTests(unittest.TestCase):
         self.assertTrue(result.startswith("Error: 'from_address'"))
 
 
-class ManageDraftsCreateSenderOverrideTests(unittest.TestCase):
-    def test_default_emits_single_alias_fallback_for_new_draft(self):
-        captured = []
+class ManageDraftsCreateTests(unittest.TestCase):
+    """manage_drafts(action="create") builds the message and hands it to
+    draft_gui; it never scripts a body into an outgoing message."""
 
-        def fake_run(script, timeout=120):
-            captured.append(script)
-            return "✓ Draft created"
+    def _run(self, identity="ID\x1fAnn Example\x1fdefault@example.com\x1fsecondary@example.org", **kwargs):
+        from apple_mail_mcp import draft_gui
 
-        with patch(
-            "apple_mail_mcp.tools.compose.run_applescript",
-            side_effect=fake_run,
-        ):
-            compose_tools.manage_drafts(
-                account="Work",
-                action="create",
-                subject="Draft",
-                to="recipient@example.com",
-                body="Body",
-            )
-
-        self.assertEqual(len(captured), 1)
-        script = captured[0]
-        self.assertIn("if (count of emailAddrs) is 1 then", script)
-        self.assertIn(
-            "set sender of newDraft to item 1 of emailAddrs", script
-        )
-        self.assertNotIn('set sender of newDraft to "', script)
-
-    def test_injects_sender_when_from_address_is_valid(self):
         scripts = []
 
         def fake_run(script, timeout=120):
             scripts.append(script)
-            if len(scripts) == 1:
-                return "default@example.com\nsecondary@example.org"
-            return "✓ Draft created"
+            return identity
 
-        with patch(
-            "apple_mail_mcp.tools.compose.run_applescript",
-            side_effect=fake_run,
+        calls = []
+
+        def fake_create(msg, **kw):
+            calls.append((msg, kw))
+            return draft_gui.DraftResult(True, ["Checked."], draft_id=4242)
+
+        args = dict(account="Work", action="create", subject="Draft",
+                    to="recipient@example.com", body="Body")
+        args.update(kwargs)
+        with (
+            patch("apple_mail_mcp.tools.compose.run_applescript", side_effect=fake_run),
+            patch("apple_mail_mcp.tools.compose.ei.account_uuid", return_value="UUID-1"),
+            patch("apple_mail_mcp.tools.compose.draft_mime.resolve_signature",
+                  return_value=(None, "none (test)")),
+            patch("apple_mail_mcp.tools.compose.draft_gui.create_in_mail", side_effect=fake_create),
         ):
-            compose_tools.manage_drafts(
-                account="Work",
-                action="create",
-                subject="Draft",
-                to="recipient@example.com",
-                body="Body",
-                from_address="secondary@example.org",
-            )
+            result = compose_tools.manage_drafts(**args)
+        return result, scripts, calls
 
-        self.assertEqual(len(scripts), 2)
-        main_script = scripts[1]
-        self.assertIn(
-            'set sender of newDraft to "secondary@example.org"', main_script
-        )
-        self.assertNotIn("if (count of emailAddrs) is 1 then", main_script)
-
-    def test_rejects_invalid_from_address_without_running_main_script(self):
-        scripts = []
-
-        def fake_run(script, timeout=120):
-            scripts.append(script)
-            return "default@example.com"
-
-        with patch(
-            "apple_mail_mcp.tools.compose.run_applescript",
-            side_effect=fake_run,
-        ):
-            result = compose_tools.manage_drafts(
-                account="Work",
-                action="create",
-                subject="Draft",
-                to="recipient@example.com",
-                body="Body",
-                from_address="unknown@example.com",
-            )
-
+    def test_default_sender_is_the_accounts_first_address(self):
+        result, scripts, calls = self._run()
         self.assertEqual(len(scripts), 1)
+        msg, kw = calls[0]
+        self.assertEqual(kw["sender"], "default@example.com")
+        self.assertIn("default@example.com", str(msg["From"]))
+        self.assertIn("Ann Example", str(msg["From"]))
+        self.assertEqual(kw["account_uuid"], "UUID-1")
+        self.assertIn("ID 4242", result)
+        self.assertIn("It was not sent", result)
+
+    def test_from_address_override(self):
+        _, _, calls = self._run(from_address="Secondary@Example.org")
+        _, kw = calls[0]
+        self.assertEqual(kw["sender"], "secondary@example.org")
+
+    def test_rejects_unknown_from_address_before_mail_is_touched(self):
+        result, _, calls = self._run(from_address="unknown@example.com")
         self.assertTrue(result.startswith("Error: 'from_address'"))
+        self.assertEqual(calls, [])
+
+    def test_no_script_sets_content_or_makes_outgoing_message(self):
+        _, scripts, _ = self._run()
+        for script in scripts:
+            self.assertNotIn("outgoing message", script)
+            self.assertNotIn("content:", script)
+            self.assertNotIn("keystroke", script)
+
+    def test_requires_subject_to_and_body(self):
+        result, scripts, calls = self._run(body=None)
+        self.assertIn("required", result)
+        self.assertEqual((scripts, calls), ([], []))
+
+    def test_attachment_checks_happen_before_mail_is_touched(self):
+        result, scripts, calls = self._run(attachments="~/.ssh/id_ed25519")
+        self.assertTrue(result.startswith("Error:"))
+        self.assertEqual((scripts, calls), ([], []))
+
+    def test_attachments_are_passed_with_hashes(self):
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf = Path(tmpdir) / "offer.pdf"
+            pdf.write_bytes(b"%PDF-1.4 test")
+            result, _, calls = self._run(attachments=[str(pdf)])
+        msg, kw = calls[0]
+        self.assertEqual(kw["attachments"], [("offer.pdf", hashlib.sha256(b"%PDF-1.4 test").hexdigest())])
+        self.assertIn("offer.pdf", result)
+        names = [part.get_filename() for part in msg.iter_attachments()]
+        self.assertEqual(names, ["offer.pdf"])
+
+    def test_failure_keeps_the_eml_and_says_so(self):
+        from apple_mail_mcp import draft_gui
+
+        failed = draft_gui.DraftResult(False, ["Mail did not create the draft: x."],
+                                       eml_path=Path("/tmp/draft-x.eml"))
+        with (
+            patch("apple_mail_mcp.tools.compose.run_applescript", return_value="ID\x1f\x1fa@example.com"),
+            patch("apple_mail_mcp.tools.compose.ei.account_uuid", return_value="UUID-1"),
+            patch("apple_mail_mcp.tools.compose.draft_mime.resolve_signature", return_value=(None, "none")),
+            patch("apple_mail_mcp.tools.compose.draft_gui.create_in_mail", return_value=failed),
+        ):
+            result = compose_tools.manage_drafts(account="Work", action="create", subject="S",
+                                                 to="b@example.com", body="B")
+        self.assertIn("the draft was not created", result)
+        self.assertIn("/tmp/draft-x.eml", result)
+
+    def test_empty_account_name_keeps_the_first_address(self):
+        _, _, calls = self._run(identity="ID\x1f\x1fsolo@example.com")
+        msg, kw = calls[0]
+        self.assertEqual(kw["sender"], "solo@example.com")
+        self.assertEqual(str(msg["From"]), "solo@example.com")
+
+    def test_html_body_is_checked_against_the_html(self):
+        _, _, calls = self._run(body="Plain fallback", html_body="<h1>Weekly Update</h1>")
+        self.assertEqual(calls[0][1]["plain_body"].strip(), "Weekly Update")
+
+    def test_compose_email_draft_mode_uses_the_same_path(self):
+        with patch("apple_mail_mcp.tools.compose._create_clean_draft", return_value="OK") as create, \
+                patch("apple_mail_mcp.tools.compose.run_applescript") as run:
+            result = compose_tools.compose_email(account="Work", to="a@example.com", subject="S",
+                                                 body="B", mode="draft")
+        self.assertEqual(result, "OK")
+        run.assert_not_called()
+        self.assertEqual(create.call_args.kwargs["text_body"], "B")
 
 
 class PasteFocusHardeningTests(unittest.TestCase):
